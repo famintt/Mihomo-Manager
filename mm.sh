@@ -9,7 +9,7 @@ umask 077
 PROJECT_NAME="Mihomo 管理器"
 SCRIPT_VERSION="1.2.0"
 REPO_OWNER="famintt"
-REPO_NAME="mm"
+REPO_NAME="Mihomo-Manager"
 
 INSTALL_BIN="${INSTALL_BIN:-/usr/local/bin/mm}"
 LIB_DIR="${LIB_DIR:-/usr/local/lib/mihomo-manager}"

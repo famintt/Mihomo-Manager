@@ -255,7 +255,7 @@ print_cli_usage() {
   支持的环境变量见 README「环境变量一键安装」章节。
 
 MTProxy（Go mtg）为独立脚本，不依赖本命令：
-  mtpt=端口 bash <(curl -fsSL https://github.com/famintt/mm/releases/latest/download/install.sh)
+  mtpt=端口 bash <(curl -fsSL https://github.com/famintt/Mihomo-Manager/releases/latest/download/install.sh)
   或已安装时直接: mtpt=端口 mtp
 EOF
 }
