@@ -51,7 +51,7 @@ PROJECT_VERSION="v1.2.0"
 PACKAGE_NAME="mihomo-manager-v1.2.0.tar.gz"
 # 发布流程：scripts/build-release-bundle.sh 构建可复现 bundle，其 SHA256 与此处一致
 # （占位值：构建 release bundle 后由 sha256sum 回填）
-PACKAGE_SHA256="de3d29302f39ab1e04917b1b48b8546029e1ff23db867dec88f74a27c955eb34"
+PACKAGE_SHA256="697eac1ff8a91279a1912b800fe2cfce1a0446a5f3a729e9558271987791b863"
 PACKAGE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${PROJECT_VERSION}/${PACKAGE_NAME}"
 
 INSTALL_BIN="/usr/local/bin/mm"
