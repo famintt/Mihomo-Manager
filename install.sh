@@ -47,11 +47,11 @@ umask 077
 
 REPO_OWNER="famintt"
 REPO_NAME="Mihomo-Manager"
-PROJECT_VERSION="v1.2.1"
-PACKAGE_NAME="mihomo-manager-v1.2.1.tar.gz"
+PROJECT_VERSION="v1.2.2"
+PACKAGE_NAME="mihomo-manager-v1.2.2.tar.gz"
 # 发布流程：scripts/build-release-bundle.sh 构建可复现 bundle，其 SHA256 与此处一致
 # （占位值：构建 release bundle 后由 sha256sum 回填）
-PACKAGE_SHA256="3d96abb7a90f45f06bfa61cc2fd735a930588f68d11a923cf330433c9576f66b"
+PACKAGE_SHA256="45d008e2217bf5c2556a90c7df85f62b4d8cb406350ea7e8e2cacb6f286c6dba"
 PACKAGE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${PROJECT_VERSION}/${PACKAGE_NAME}"
 
 INSTALL_BIN="/usr/local/bin/mm"
