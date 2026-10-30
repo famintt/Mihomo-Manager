@@ -7,6 +7,7 @@ cli_add_usage() {
 
 协议:
   reality       VLESS-Reality (TCP)
+  xudp          VLESS+XUDP+Reality (TCP)
   anytls        AnyTLS (TCP)
   tuic          TUIC v5 (UDP)
   hysteria2     Hysteria2 (UDP)
@@ -134,6 +135,10 @@ cli_add() {
     reality|vless-reality)
       export vlrt="${port}"
       [ -n "${sni}" ] && export vl_sni="${sni}"
+      ;;
+    xudp|xudp-reality|vless-xudp)
+      export vxpt="${port}"
+      [ -n "${sni}" ] && export vx_sni="${sni}"
       ;;
     anytls)
       export anypt="${port}"

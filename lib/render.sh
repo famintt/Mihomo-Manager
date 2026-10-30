@@ -326,6 +326,23 @@ render_inbound_for_tag() {
     printf '      server-names:\n'
     printf '        - %s\n' "$(yaml_quote "$reality_server")"
     ;;
+  vless-xudp)
+    # VLESS + Reality + XUDP：XUDP 是 VLESS 的 UDP-over-TCP 封装，
+    # Mihomo listener 收到 CommandMux 后自动处理，不需要 packet-encoding/mux 配置。
+    printf '  - type: vless\n'
+    printf '    name: %s\n' "$(yaml_quote "$tag")"
+    printf '    listen: %s\n' "$(yaml_quote '::')"
+    printf '    port: %s\n' "$port"
+    printf '    users:\n'
+    printf '      - username: %s\n' "$(yaml_quote "$name")"
+    printf '        uuid: %s\n' "$(yaml_quote "$uuid")"
+    printf '    reality-config:\n'
+    printf '      dest: %s\n' "$(yaml_quote "${reality_server}:443")"
+    printf '      private-key: %s\n' "$(yaml_quote "$private_key")"
+    _emit_short_ids "$short_id"
+    printf '      server-names:\n'
+    printf '        - %s\n' "$(yaml_quote "$reality_server")"
+    ;;
   vless-ws-tls)
     # 主 listener：TLS 端口（CDN 模式统一单端口：客户端连 CDN 边缘，CF 按 SSL 模式
     # Full/Full(Strict) 以 HTTPS 回源到本 TLS 端口，无需明文回源 listener）。

@@ -2,7 +2,7 @@
 
 **在线一键命令生成器：<https://mm.1733.dpdns.org>**（即本仓库 `interface/worker.js` 的部署，可自行用 Pages/Workers 托管）—— 填协议端口即可生成下面的环境变量一键安装命令。
 
-面向常用 mihomo 内核的管理脚本：安装核心、添加节点、生成分享链接、自动保活一体化，支持 VLESS-Reality / VLESS-WS-TLS / AnyTLS / VLESS-Argo / TUIC v5 / Hysteria2 / SOCKS5；并附带独立的 **MTProxy（Go mtg）** 管理脚本。
+面向常用 mihomo 内核的管理脚本：安装核心、添加节点、生成分享链接、自动保活一体化，支持 VLESS-Vision-Reality / VLESS-XUDP-Reality / VLESS-WS-TLS / AnyTLS / VLESS-Argo / TUIC v5 / Hysteria2 / SOCKS5；并附带独立的 **MTProxy（Go mtg）** 管理脚本。
 
 ## 快速安装
 
@@ -22,7 +22,7 @@ vlrt=2083 hypt=2082 name='HK' mm rep      # 已安装时
 
 | 变量 | 说明 | 默认 |
 |---|---|---|
-| `vlrt` `wspt` `tupt` `anypt` `hypt` `socks5pt` | 各协议端口，填了即启用 | 不启用 |
+| `vlrt` `vxpt` `wspt` `tupt` `anypt` `hypt` `socks5pt` | 各协议端口，填了即启用 | 不启用 |
 | `argo=vlpt` `argo_pt` | 启用 VLESS-Argo；本地端口 | 8001 |
 | `agn` `agk` | Argo 固定隧道域名 + Token（临时隧道留空） | 临时隧道 |
 | `cdn_host` | CDN 中转连接地址（优选 IP/域名），WS-TLS CDN 使用（Argo 也可回退使用） | `saas.sin.fan` |
@@ -41,7 +41,7 @@ vlrt=2083 hypt=2082 name='HK' mm rep      # 已安装时
 | `uuid` | VLESS/TUIC 共用 UUID | 自动生成 |
 | `passwd` | AnyTLS/HY2/TUIC 密码 | 自动生成 |
 | `name` | 节点名前缀（生成 `HK-Reality` 等） | 内置默认名 |
-| `vl_sni` `ws_host` `tu_sni` `any_sni` `hy_sni` | 各协议 SNI（ws_host 仅供命令行 `ws_mode=direct` 直连用；界面 WS 已仅 CDN，SNI/Host 用 `ws_cdn_sni`） | `www.apple.com` |
+| `vl_sni` `vx_sni` `ws_host` `tu_sni` `any_sni` `hy_sni` | 各协议 SNI（ws_host 仅供命令行 `ws_mode=direct` 直连用；界面 WS 已仅 CDN，SNI/Host 用 `ws_cdn_sni`） | `www.apple.com` |
 | `ws_path` | WS 路径 | 随机 |
 | `up_mbps` `down_mbps` | HY2 带宽 | 200 |
 | `socks5_username` `socks5_password` | SOCKS5 账号 | user / 随机 |
@@ -59,6 +59,16 @@ vlrt=2083 hypt=2082 name='HK' mm rep      # 已安装时
 | `socks5_wl_flag` / `socks5_ips` | Socks5 源地址白名单（iptables；逗号分隔 IP/CIDR） | 关闭 / 空 |
 | `debug_flag` | 调试日志开关（1=debug） | 0 |
 | `sub_machine` | Worker 中的机器 slug，默认取 `name` 或主机名并转小写 | 自动 |
+
+## VLESS+XUDP+Reality（主线）
+
+`vxpt` 启用 VLESS + Reality + XUDP 入站：服务端是 VLESS/Reality(TCP)，XUDP 是客户端对 UDP 的封装方式。Mihomo listener 会自动处理 VLESS `CommandMux`，服务端不需要 `packet-encoding` 或额外 multiplex 配置。
+
+```bash
+vxpt=5444 vx_sni=www.bing.com name='HK' mm rep
+```
+
+客户端（Mihomo）需使用 `packet-encoding: xudp` 并开启 `udp: true`；XUDP 本质是 UDP over TCP，延迟通常不如 TUIC/Hysteria2，适合 UDP 被封或需要 TCP 穿透的场景。
 
 ## WS-TLS + CDN（CF 证书方案，v1.2.4）
 

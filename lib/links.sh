@@ -58,6 +58,18 @@ EOF
     printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s' \
       "$uuid" "$host" "$port" "$reality_server" "$public_key" "$short_id" "$name"
     ;;
+  vless-xudp)
+    {
+      read -r reality_server_enc
+      read -r public_key_enc
+      read -r short_id_enc
+      read -r name_enc
+    } <<EOF
+$(url_encode_many "${reality_server}" "${public_key}" "${short_id}" "${name}")
+EOF
+    printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&packetEncoding=xudp#%s' \
+      "$uuid" "$host" "$port" "$reality_server_enc" "$public_key_enc" "$short_id_enc" "$name_enc"
+    ;;
   vless-ws-tls)
     ws_mode="${ws_mode:-direct}"
     cdn_port="${cdn_port:-443}"

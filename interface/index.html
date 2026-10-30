@@ -208,7 +208,8 @@
 
         <h3>直连协议（可自由组合）</h3>
         <div class="pgrid">
-          <div class="pitem"><label>VLESS-Reality <span class="pill">vlrt</span></label><input type="text" class="port-input" id="vlrt" placeholder="如 2083，或点 🎲 随机" inputmode="numeric"></div>
+          <div class="pitem"><label>VLESS+Vision+Reality <span class="pill">vlrt</span></label><input type="text" class="port-input" id="vlrt" placeholder="如 2083，或点 🎲 随机" inputmode="numeric"></div>
+          <div class="pitem"><label>VLESS+XUDP+Reality <span class="pill">vxpt</span></label><input type="text" class="port-input" id="vxpt" placeholder="如 5444，或点 🎲 随机" inputmode="numeric"></div>
           <div class="pitem"><label>AnyTLS <span class="pill">anypt</span></label><input type="text" class="port-input" id="anypt" placeholder="如 5443，或点 🎲 随机" inputmode="numeric"></div>
           <div class="pitem"><label>TUIC v5 <span class="pill">tupt</span></label><input type="text" class="port-input" id="tupt" placeholder="如 10443，或点 🎲 随机" inputmode="numeric"></div>
           <div class="pitem"><label>Hysteria2 <span class="pill">hypt</span></label><input type="text" class="port-input" id="hypt" placeholder="如 11443，或点 🎲 随机" inputmode="numeric"></div>
@@ -222,6 +223,13 @@
           <div class="ctl">
             <input type="text" id="vl_sni" class="has-pick" placeholder="留空自动检测，或输入域名">
             <select class="pick sni-pick" data-target="vl_sni"><option value="">自动检测</option><option value="auto">自动检测（显式）</option></select>
+          </div>
+        </div>
+        <div class="row">
+          <label>XUDP Reality SNI <span class="pill">vx_sni</span></label>
+          <div class="ctl">
+            <input type="text" id="vx_sni" class="has-pick" placeholder="留空默认 www.bing.com；输入 auto 自动检测">
+            <select class="pick sni-pick" data-target="vx_sni"><option value="">自动检测</option><option value="auto">自动检测（显式）</option></select>
           </div>
         </div>
         <div id="reality-key-wrap" style="display:none">
@@ -753,7 +761,7 @@
       numEnv('mtpt', 'mtpt', envs);
     }
     // 直连协议端口
-    ['vlrt', 'wspt', 'tupt', 'anypt', 'hypt'].forEach(function (k) { numEnv(k, k, envs); });
+    ['vlrt', 'vxpt', 'wspt', 'tupt', 'anypt', 'hypt'].forEach(function (k) { numEnv(k, k, envs); });
     if (val('socks5-mode') === 'on') {
       numEnv('socks5pt', 'socks5pt', envs);
     }
@@ -779,7 +787,8 @@
     }
     // SNI 与 WS
     strEnv('vl_sni', 'vl_sni', envs);
-    if (val('vlrt') && val('reality-key-mode') === 'on') {
+    strEnv('vx_sni', 'vx_sni', envs);
+    if ((val('vlrt') || val('vxpt')) && val('reality-key-mode') === 'on') {
       strEnv('reality_private', 'reality-private', envs);
       strEnv('reality_public', 'reality-public', envs);
     }
@@ -866,7 +875,7 @@
     var input = $id('socks5-ips'); if (input) input.disabled = !on;
   }
   function syncReality() {
-    var enabled = !!val('vlrt');
+    var enabled = !!val('vlrt') || !!val('vxpt');
     var on = enabled && val('reality-key-mode') === 'on';
     var wrap = $id('reality-key-wrap'); if (wrap) wrap.style.display = enabled ? '' : 'none';
     var box = $id('reality-key-extra'); if (box) box.style.display = on ? '' : 'none';

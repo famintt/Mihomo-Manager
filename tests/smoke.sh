@@ -112,7 +112,9 @@ assert_eval_false "env_port 端口越界" 'vlrt=70000; env_port vlrt'
 assert_eval_false "env_port 未设置" 'unset vlrt; env_port vlrt'
 assert_eval_true "auto_has_node_env 有 vlrt" 'vlrt=2083; auto_has_node_env'
 assert_eval_true "auto_has_node_env 有 argo" 'argo=vlpt; auto_has_node_env'
-assert_eval_false "auto_has_node_env 全空" 'unset vlrt wspt tupt anypt hypt socks5pt argo; auto_has_node_env'
+assert_eval_true "auto_has_node_env 有 vxpt" 'vxpt=5444; auto_has_node_env'
+assert_eval_true "auto_collect_specs 含 vxpt" 'export vxpt=20840; grep -q "vless-xudp 20840" <<<"$(auto_collect_specs)"'
+assert_eval_false "auto_has_node_env 全空" 'unset vlrt vxpt wspt tupt anypt hypt socks5pt argo; auto_has_node_env'
 assert_eval_true "auto_argo_requested vlpt" 'argo=vlpt; auto_argo_requested'
 assert_eval_false "auto_argo_requested trpt" 'argo=trpt; auto_argo_requested'
 assert_eval_false "auto_argo_requested 未设置" 'unset argo; auto_argo_requested'
@@ -726,6 +728,18 @@ EOF
 chmod 0755 "${STUB_BIN}/mihomo"
 export MIHOMO_BIN="${STUB_BIN}/mihomo"
 
+# XUDP Reality 独立回归：不改变下方 6 协议 auto_install 基线
+export vxpt=20837 vx_sni=www.bing.com
+assert_eval_true "XUDP 自动添加成功" '( auto_add_vless_xudp 20837 )'
+_xudp_tag="$(jq -r 'to_entries[] | select(.value.protocol=="vless-xudp") | .key' "${NODES_FILE}" | head -n 1)"
+assert_eq "XUDP 协议写入" "vless-xudp" "$(node_value "${_xudp_tag}" protocol)"
+assert_eval_true "XUDP 节点含 Reality 公钥" 'jq -e "to_entries[] | select(.value.protocol==\"vless-xudp\") | .value.public_key | length > 0" "${NODES_FILE}"'
+render_config
+assert_eval_true "XUDP listener 渲染" 'grep -q "name: .*XUDP-Reality" "${CONFIG_FILE}"'
+assert_eval_false "XUDP listener 不带 flow" 'grep -A8 "name: .*XUDP-Reality" "${CONFIG_FILE}" | grep -q "flow:"'
+assert_eval_true "XUDP 分享链接含 packetEncoding" "build_share_link '${_xudp_tag}' | grep -q 'security=reality.*packetEncoding=xudp'"
+unset vxpt
+wipe_records
 export vlrt=20831 wspt=20835 anypt=20834 tupt=20833 hypt=20832 socks5pt=20836
 export name=HK uuid=11111111-2222-3333-4444-555555555555 passwd=testpw
 export cdn_host=cdn.example.com ws_host=ws.example.com ws_path=/wspath

@@ -142,6 +142,57 @@ auto_add_vless_reality() {
   auto_save_node "$tag" "$node_json" "$secret_json"
   print_ok "已写入节点：${name} | 端口: ${port}"
 }
+auto_add_vless_xudp() {
+  local port="$1"
+  local tag name uuid reality_server key_output private_key public_key short_id node_json secret_json
+  tag="$(generate_tag "vless-xudp")"
+  if [ -n "${ENV_NAME:-}" ]; then name="${ENV_NAME}-XUDP-Reality"; else name="VLESS-XUDP-Reality"; fi
+  uuid="${ENV_UUID:-$(generate_uuid)}"
+  reality_server="${ENV_VX_SNI:-${DEFAULT_REALITY_SERVER}}"
+
+  private_key="$(manager_env_or_setting "reality_private" "")"
+  public_key="$(manager_env_or_setting "reality_public" "")"
+  if [ -z "${private_key}" ] || [ -z "${public_key}" ]; then
+    if [ -n "${private_key}" ] || [ -n "${public_key}" ]; then
+      print_warn "reality_private/reality_public 必须成对提供，缺少一项，将重新生成 Reality 密钥对。"
+    fi
+    if ! key_output="$("${MIHOMO_BIN}" generate reality-keypair)"; then
+      print_err "生成 Reality 密钥对失败，跳过 vxpt 节点。"
+      return 1
+    fi
+    private_key="$(printf '%s\n' "$key_output" | sed -n 's/^PrivateKey:[[:space:]]*//p' | head -n 1)"
+    public_key="$(printf '%s\n' "$key_output" | sed -n 's/^PublicKey:[[:space:]]*//p' | head -n 1)"
+  fi
+  if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+    print_err "无法解析 Reality 密钥对，跳过 vxpt 节点。"
+    return 1
+  fi
+  if ! short_id="$(resolve_short_ids "$(env_var "short_ids")")"; then
+    short_id="$(generate_hex 4)"
+  fi
+
+  node_json="$(jq -n \
+    --arg protocol "vless-xudp" \
+    --arg name "$name" \
+    --argjson port "$port" \
+    --arg reality_server "$reality_server" \
+    --arg public_key "$public_key" \
+    --arg short_id "$short_id" '{
+      protocol: $protocol,
+      name: $name,
+      port: $port,
+      reality_server: $reality_server,
+      public_key: $public_key,
+      short_id: $short_id
+    }')"
+
+  secret_json="$(jq -n \
+    --arg uuid "$uuid" \
+    --arg private_key "$private_key" '{ uuid: $uuid, private_key: $private_key }')"
+
+  auto_save_node "$tag" "$node_json" "$secret_json"
+  print_ok "已写入节点：${name} | 端口: ${port} | XUDP Reality"
+}
 auto_add_vless_ws_tls() {
   local port="$1"
   local tag name uuid preferred_domain host_domain ws_path cert_bundle cert_mode cert_file key_file node_json secret_json ws_mode cdn_port cdn_sni
@@ -417,7 +468,7 @@ auto_install() {
   local added=0 failed=0
   local -a specs=()
   local ENV_NAME ENV_UUID ENV_PASSWD
-  local ENV_VL_SNI ENV_TU_SNI ENV_ANY_SNI ENV_HY_SNI ENV_WS_HOST ENV_WS_PATH ENV_CDN_HOST
+  local ENV_VL_SNI ENV_VX_SNI ENV_TU_SNI ENV_ANY_SNI ENV_HY_SNI ENV_WS_HOST ENV_WS_PATH ENV_CDN_HOST
   local ENV_WS_MODE ENV_CDN_PORT
   local ENV_ARGO_CDN_HOST ENV_ARGO_CDN_PORT
   local ENV_WS_CDN_CF_HOST ENV_WS_CDN_CF_PT ENV_WS_CDN_SNI
@@ -431,7 +482,7 @@ auto_install() {
   init_storage
 
   if ! auto_has_node_env; then
-    print_err "未检测到任何节点环境变量（vlrt / wspt / tupt / anypt / hypt / socks5pt / argo），放弃安装。"
+    print_err "未检测到任何节点环境变量（vlrt / vxpt / wspt / tupt / anypt / hypt / socks5pt / argo），放弃安装。"
     print_info "示例：vlrt=2083 hypt=2082 name='HK' mm ${action}"
     exit 1
   fi
@@ -481,6 +532,7 @@ auto_install() {
   else
     ENV_VL_SNI="$(env_domain_or_default "vl_sni" "${DEFAULT_REALITY_SERVER}")"
   fi
+  ENV_VX_SNI="$(tls_sni_auto "vx_sni" "${DEFAULT_REALITY_SERVER}")"
   ENV_TU_SNI="$(tls_sni_auto "tu_sni" "${DEFAULT_TLS_SERVER}")"
   ENV_ANY_SNI="$(tls_sni_auto "any_sni" "${DEFAULT_TLS_SERVER}")"
   ENV_HY_SNI="$(tls_sni_auto "hy_sni" "${DEFAULT_TLS_SERVER}")"
@@ -527,6 +579,13 @@ auto_install() {
     vless-reality)
       if auto_try_port "$port" "VLESS-Reality"; then
         auto_add_vless_reality "$port" && added=$((added + 1)) || failed=$((failed + 1))
+      else
+        failed=$((failed + 1))
+      fi
+      ;;
+    vless-xudp)
+      if auto_try_port "$port" "VLESS-XUDP-Reality"; then
+        auto_add_vless_xudp "$port" && added=$((added + 1)) || failed=$((failed + 1))
       else
         failed=$((failed + 1))
       fi
