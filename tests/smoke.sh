@@ -64,6 +64,12 @@ esac
 # shellcheck source=../mm.sh
 source "${ROOT_DIR}/mm.sh"
 
+# --- v1.2.4：WS 默认自签证书 ---
+assert_eq "VERSION 稳定版 1.2.4" "v1.2.4" "$(tr -d "\r\n" < "${ROOT_DIR}/VERSION")"
+assert_eval_true "UI WS 证书默认自签" 'grep -q '\''id="ws_cert_mode"'\'' "${ROOT_DIR}/interface/index.html" && grep -q '\''value="self" selected'\'' "${ROOT_DIR}/interface/index.html"'
+assert_eval_true "UI WS 自定义证书默认隐藏" 'grep -q '\''id="ws-custom-cert" style="display:none"'\'' "${ROOT_DIR}/interface/index.html"'
+assert_eval_true "UI WS 端口标明源站回源" 'grep -q "源站回源端口（TLS）" "${ROOT_DIR}/interface/index.html"'
+
 # --- 模块分组索引（对应 docs/ARCHITECTURE.md 的 lib/*.sh 分层） ---
 # env       : 前置检查/陷阱（隐含：mm.sh 加载即验证）；normalize_input 依赖的变量
 # fmt       : normalize_input / env_var / IP 工具 / IPv6 authority 编码

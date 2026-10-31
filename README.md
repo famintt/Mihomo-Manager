@@ -75,6 +75,7 @@ vxpt=5444 vx_sni=www.bing.com name='HK' mm rep
 v1.2.4 起 WS-TLS 的 CDN 中转采用 **Cloudflare 证书方案**：源站只有一个 TLS WS inbound（端口 `wspt`），即**统一的回源端口**，不再生成明文 HTTP 回源 inbound、不再依赖 nginx。Cloudflare 边缘 SSL 模式设为 **Full** 或 **Full(Strict)**，以 HTTPS 回源到该 TLS 端口。
 
 - **Full（推荐，默认 `cert=self`）**：源站用内置自签证书（99 年）即可，Cloudflare 边缘→源站全程加密但**不校验**源站证书，无需任何额外文件。
+- Web 生成器“源站证书”默认选中 **自签证书**；只有 Full(Strict) 才需要切到“粘贴证书”并填 Origin CA 证书/私钥。
 - **Full(Strict)**：Cloudflare 会校验源站证书，需选 `cert=custom`。在 DNS 控制台 SSL/TLS → Origin Server → Create Certificate 生成 **Cloudflare Origin CA 证书**，把证书与私钥全文**直接粘贴**到生成器（自动以 base64 传服务器解码存储），无需先上传文件。
 
 端口关系：客户端连 `cdn_host:cdn_port`（443/2053/2083/2087/2096/8443），SNI/Host 用**必填**的 `ws_cdn_sni`；Cloudflare 收到回源域名后按 SSL 模式把请求以 HTTPS 转发到源站。回源默认目标是 **443**，故建议直接设 `wspt=443`（此时 `wspt` 即统一端口）；若 `wspt` 用其他值，需在 Cloudflare 控制台为该域名添加 **Origin Rule**，把 443 改写为你的 `wspt`。
