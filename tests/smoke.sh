@@ -64,8 +64,8 @@ esac
 # shellcheck source=../mm.sh
 source "${ROOT_DIR}/mm.sh"
 
-# --- v1.2.4：WS 默认自签证书 ---
-assert_eq "VERSION 稳定版 1.2.4" "v1.2.4" "$(tr -d "\r\n" < "${ROOT_DIR}/VERSION")"
+# --- v1.2.5：订阅上报变化检测 / WS 自签 ---
+assert_eq "VERSION 稳定版 1.2.5" "v1.2.5" "$(tr -d "\r\n" < "${ROOT_DIR}/VERSION")"
 assert_eval_true "UI WS 证书默认自签" 'grep -q '\''id="ws_cert_mode"'\'' "${ROOT_DIR}/interface/index.html" && grep -q '\''value="self" selected'\'' "${ROOT_DIR}/interface/index.html"'
 assert_eval_true "UI WS 自定义证书默认隐藏" 'grep -q '\''id="ws-custom-cert" style="display:none"'\'' "${ROOT_DIR}/interface/index.html"'
 assert_eval_true "UI WS 端口标明源站回源" 'grep -q "源站回源端口（TLS）" "${ROOT_DIR}/interface/index.html"'
@@ -830,6 +830,9 @@ dns_servers="" render_config
 # mm sub：base64 订阅输出（6 节点）
 assert_eval_true "sub 输出非空 base64" 'c="$(sub_command)"; [ "${#c}" -gt 100 ] && [[ "${c}" =~ ^[A-Za-z0-9+/=]+$ ]]'
 assert_eval_true "sub 解码后包含节点链接" 'c="$(sub_command)"; printf %s "${c}" | base64 -d | grep -q "vless://"'
+assert_eval_true "sub links.txt 主文件可生成" 'sub_build_file'
+assert_eval_true "sub links.txt 是明文主文件" '[ -s "$(sub_links_file)" ] && grep -q "^vless://" "$(sub_links_file)"'
+assert_eval_true "sub base64 内容与 links.txt 一致" 'c="$(sub_command)"; printf %s "${c}" | base64 -d | cmp -s - "$(sub_links_file)"'
 assert_eq "sub_mode 默认 temp" "temp" "$(unset -v sub_mode; sub_mode)"
 assert_eq "sub_mode worker" "worker" "$(sub_mode=worker; sub_mode)"
 assert_eq "sub_worker_base 补 https" "https://sub.example.com" "$(sub_domain=sub.example.com; sub_worker_base)"
