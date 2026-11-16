@@ -41,7 +41,7 @@ vlrt=2083 hypt=2082 name='HK' mm rep      # 已安装时
 | `uuid` | VLESS/TUIC 共用 UUID | 自动生成 |
 | `passwd` | AnyTLS/HY2/TUIC 密码 | 自动生成 |
 | `name` | 节点名前缀（生成 `HK-Reality` 等） | 内置默认名 |
-| `vl_sni` `vx_sni` `ws_host` `tu_sni` `any_sni` `hy_sni` | 各协议 SNI（ws_host 仅供命令行 `ws_mode=direct` 直连用；界面 WS 已仅 CDN，SNI/Host 用 `ws_cdn_sni`） | `www.apple.com` |
+| `vl_sni` `vx_sni` `ws_host` `tu_sni` `any_sni` `hy_sni` | 各协议 SNI（ws_host 仅供命令行 `ws_mode=direct` 直连用；界面 WS 已仅 CDN，SNI/Host 用 `ws_cdn_sni`） | `pypi.org` |
 | `ws_path` | WS 路径 | 随机 |
 | `up_mbps` `down_mbps` | HY2 带宽 | 200 |
 | `socks5_username` `socks5_password` | SOCKS5 账号 | user / 随机 |
@@ -65,7 +65,7 @@ vlrt=2083 hypt=2082 name='HK' mm rep      # 已安装时
 `vxpt` 启用 VLESS + Reality + XUDP 入站：服务端是 VLESS/Reality(TCP)，XUDP 是客户端对 UDP 的封装方式。Mihomo listener 会自动处理 VLESS `CommandMux`，服务端不需要 `packet-encoding` 或额外 multiplex 配置。
 
 ```bash
-vxpt=5444 vx_sni=www.bing.com name='HK' mm rep
+vxpt=5444 vx_sni=pypi.org name='HK' mm rep
 ```
 
 客户端（Mihomo）需使用 `packet-encoding: xudp` 并开启 `udp: true`；XUDP 本质是 UDP over TCP，延迟通常不如 TUIC/Hysteria2，适合 UDP 被封或需要 TCP 穿透的场景。
