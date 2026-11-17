@@ -7,7 +7,7 @@ set -eEuo pipefail
 umask 077
 
 PROJECT_NAME="Mihomo 管理器"
-SCRIPT_VERSION="1.2.5"
+SCRIPT_VERSION="1.2.6"
 REPO_OWNER="famintt"
 REPO_NAME="Mihomo-Manager"
 

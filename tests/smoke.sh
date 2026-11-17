@@ -65,7 +65,7 @@ esac
 source "${ROOT_DIR}/mm.sh"
 
 # --- v1.2.5：订阅上报变化检测 / WS 自签 ---
-assert_eq "VERSION 稳定版 1.2.5" "v1.2.5" "$(tr -d "\r\n" < "${ROOT_DIR}/VERSION")"
+assert_eq "VERSION 稳定版 1.2.6" "v1.2.6" "$(tr -d "\r\n" < "${ROOT_DIR}/VERSION")"
 assert_eval_true "UI WS 证书默认自签" 'grep -q '\''id="ws_cert_mode"'\'' "${ROOT_DIR}/interface/index.html" && grep -q '\''value="self" selected'\'' "${ROOT_DIR}/interface/index.html"'
 assert_eval_true "UI WS 自定义证书默认隐藏" 'grep -q '\''id="ws-custom-cert" style="display:none"'\'' "${ROOT_DIR}/interface/index.html"'
 assert_eval_true "UI WS 端口标明源站回源" 'grep -q "源站回源端口（TLS）" "${ROOT_DIR}/interface/index.html"'
