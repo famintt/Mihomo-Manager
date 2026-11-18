@@ -65,7 +65,7 @@ esac
 source "${ROOT_DIR}/mm.sh"
 
 # --- v1.2.5：订阅上报变化检测 / WS 自签 ---
-assert_eq "VERSION 稳定版 1.2.6" "v1.2.6" "$(tr -d "\r\n" < "${ROOT_DIR}/VERSION")"
+assert_eq "VERSION 稳定版 1.2.7" "v1.2.7" "$(tr -d "\r\n" < "${ROOT_DIR}/VERSION")"
 assert_eval_true "UI WS 证书默认自签" 'grep -q '\''id="ws_cert_mode"'\'' "${ROOT_DIR}/interface/index.html" && grep -q '\''value="self" selected'\'' "${ROOT_DIR}/interface/index.html"'
 assert_eval_true "UI WS 自定义证书默认隐藏" 'grep -q '\''id="ws-custom-cert" style="display:none"'\'' "${ROOT_DIR}/interface/index.html"'
 assert_eval_true "UI WS 端口标明源站回源" 'grep -q "源站回源端口（TLS）" "${ROOT_DIR}/interface/index.html"'
@@ -741,8 +741,8 @@ _xudp_tag="$(jq -r 'to_entries[] | select(.value.protocol=="vless-xudp") | .key'
 assert_eq "XUDP 协议写入" "vless-xudp" "$(node_value "${_xudp_tag}" protocol)"
 assert_eval_true "XUDP 节点含 Reality 公钥" 'jq -e "to_entries[] | select(.value.protocol==\"vless-xudp\") | .value.public_key | length > 0" "${NODES_FILE}"'
 render_config
-assert_eval_true "XUDP listener 渲染" 'grep -q "name: .*XUDP-Reality" "${CONFIG_FILE}"'
-assert_eval_false "XUDP listener 不带 flow" 'grep -A8 "name: .*XUDP-Reality" "${CONFIG_FILE}" | grep -q "flow:"'
+assert_eval_true "XUDP listener 渲染" 'grep -q "name: .*XUDP" "${CONFIG_FILE}"'
+assert_eval_false "XUDP listener 不带 flow" 'grep -A8 "name: .*XUDP" "${CONFIG_FILE}" | grep -q "flow:"'
 assert_eval_true "XUDP 分享链接含 packetEncoding" "build_share_link '${_xudp_tag}' | grep -q 'security=reality.*packetEncoding=xudp'"
 unset vxpt
 wipe_records
@@ -898,6 +898,12 @@ assert_eval_true "mtp_run_args 空模式回退 v4" 'mtp_run_args 20086 eeabcd | 
 
 # 生成的 tg 链接可解码回原文：0xee + secret(16字节) + domain ascii
 assert_eval_true "mtp_tg_secret 可解码回原文" 's="$(mtp_tg_secret "cafebabecafebabecafebabecafebabe" "www.apple.com")"; p="$(printf %s "$s" | sed "s/-/+/g;s/_/\//g")"; while [ $(( ${#p} % 4 )) -ne 0 ]; do p="$p="; done; h="$(printf %s "$p" | base64 -d 2>/dev/null | od -A n -t x1 | tr -d " \n")"; [[ "$h" == "eecafebabecafebabecafebabecafebabe7777772e6170706c652e636f6d" ]]'
+
+# 节点显示名：机器名原样保留，协议名固定大小写，不强制大写机器名。
+assert_eq "命名：小写机器名+Reality" "hk-yt-Reality" "$(ENV_NAME=hk-yt node_display_name Reality)"
+assert_eq "命名：大小写机器名+AnyTLS" "HK-YT-AnyTLS" "$(ENV_NAME=HK-YT node_display_name AnyTLS)"
+assert_eq "命名：TUIC" "TUIC" "$(ENV_NAME= node_display_name TUIC)"
+assert_eq "命名：XUDP" "MiXeD-XUDP" "$(ENV_NAME=MiXeD node_display_name XUDP)"
 
 rm -rf "${TEST_ROOT}"
 
