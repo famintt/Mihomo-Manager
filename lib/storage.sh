@@ -9,7 +9,7 @@ ensure_dir_mode() {
   if install -d -m "$mode" "$dir" 2>/dev/null; then
     return 0
   fi
-  mkdir -p "$dir"
+  mkdir -p "$dir" || return 1
   chmod "$mode" "$dir"
 }
 
@@ -17,125 +17,196 @@ ensure_file_mode() {
   local file="$1"
   local mode="$2"
   local default_content="${3:-}"
+  [ ! -L "$file" ] || return 1
   if [ ! -f "$file" ]; then
-    printf '%s' "$default_content" >"$file"
+    printf '%s' "$default_content" >"$file" || return 1
   fi
   chmod "$mode" "$file"
 }
 
+validate_json_object() {
+  local file="$1"
+  [ -f "$file" ] && [ ! -L "$file" ] &&
+    jq -se 'length == 1 and (.[0] | type == "object")' "$file" >/dev/null 2>&1
+}
+
+validate_storage_tables() {
+  local nodes="${1:-${NODES_FILE}}" secrets="${2:-${SECRETS_FILE}}" file
+  for file in "$nodes" "$secrets"; do
+    if [ ! -f "$file" ] || [ -L "$file" ] ||
+      ! jq -se 'length == 1 and (.[0] | type == "object" and all(.[]; type == "object"))' "$file" >/dev/null 2>&1; then
+      print_err "状态表缺失或不是有效的 JSON 对象，停止操作：$file"
+      return 1
+    fi
+  done
+}
+
 init_storage() {
-  ensure_dir_mode "${BASE_DIR}" 700
-  ensure_dir_mode "${LIB_DIR}" 700
-  ensure_dir_mode "${CERT_DIR}" 700
-  ensure_dir_mode "${LOG_DIR}" 700
-  ensure_dir_mode "${RUNTIME_DIR}" 700
-  ensure_file_mode "${NODES_FILE}" 600 "{}"$'\n'
-  ensure_file_mode "${SECRETS_FILE}" 600 "{}"$'\n'
-  ensure_file_mode "${CONFIG_FILE}" 600 "{}"$'\n'
-  ensure_file_mode "${SETTING_FILE}" 600 "{}"$'\n'
+  # A partial installation is evidence of damage, never a new empty database.
+  if [ -e "${NODES_FILE}" ] || [ -L "${NODES_FILE}" ] ||
+    [ -e "${SECRETS_FILE}" ] || [ -L "${SECRETS_FILE}" ]; then
+    validate_storage_tables || return 1
+  elif [ -e "${CONFIG_FILE}" ] || [ -e "${SETTING_FILE}" ]; then
+    print_err "既有安装的节点/密钥表丢失，请先恢复备份。"
+    return 1
+  fi
+  if [ -e "${SETTING_FILE}" ] && ! validate_json_object "${SETTING_FILE}"; then
+    print_err "设置文件损坏，停止初始化：${SETTING_FILE}"
+    return 1
+  fi
+  local dir
+  for dir in "${BASE_DIR}" "${LIB_DIR}" "${CERT_DIR}" "${LOG_DIR}" "${RUNTIME_DIR}"; do
+    [ ! -L "$dir" ] || { print_err "拒绝符号链接目录：$dir"; return 1; }
+    ensure_dir_mode "$dir" 700 || return 1
+  done
+  ensure_file_mode "${NODES_FILE}" 600 "{}"$'\n' || return 1
+  ensure_file_mode "${SECRETS_FILE}" 600 "{}"$'\n' || return 1
+  ensure_file_mode "${CONFIG_FILE}" 600 "{}"$'\n' || return 1
+  ensure_file_mode "${SETTING_FILE}" 600 "{}"$'\n' || return 1
+  if declare -F service_data_permissions >/dev/null 2>&1; then
+    service_data_permissions || return 1
+  fi
 }
 
 sanitize_permissions() {
-  ensure_dir_mode "${BASE_DIR}" 700
-  ensure_dir_mode "${LIB_DIR}" 700
-  ensure_dir_mode "${CERT_DIR}" 700
-  ensure_dir_mode "${LOG_DIR}" 700
-  ensure_dir_mode "${RUNTIME_DIR}" 700
-
-  [ -f "${NODES_FILE}" ] && chmod 600 "${NODES_FILE}"
-  [ -f "${SECRETS_FILE}" ] && chmod 600 "${SECRETS_FILE}"
-  [ -f "${CONFIG_FILE}" ] && chmod 600 "${CONFIG_FILE}"
-  [ -f "${SETTING_FILE}" ] && chmod 600 "${SETTING_FILE}"
-
-  find "${CERT_DIR}" -type f -name '*.key' -exec chmod 600 {} \; 2>/dev/null || true
-  find "${CERT_DIR}" -type f -name '*.crt' -exec chmod 600 {} \; 2>/dev/null || true
-  find "${RUNTIME_DIR}" -type f -exec chmod 600 {} \; 2>/dev/null || true
+  local dir file
+  for dir in "${BASE_DIR}" "${LIB_DIR}" "${CERT_DIR}" "${LOG_DIR}" "${RUNTIME_DIR}"; do
+    [ ! -L "$dir" ] || { print_err "拒绝符号链接目录：$dir"; return 1; }
+    ensure_dir_mode "$dir" 700 || return 1
+  done
+  for file in "${NODES_FILE}" "${SECRETS_FILE}" "${CONFIG_FILE}" "${SETTING_FILE}"; do
+    [ ! -L "$file" ] || return 1
+    [ ! -f "$file" ] || chmod 600 "$file" || return 1
+  done
+  find "${CERT_DIR}" -type f -exec chmod 600 {} + || return 1
+  find "${RUNTIME_DIR}" -type f -exec chmod 600 {} + || return 1
+  if declare -F service_data_permissions >/dev/null 2>&1; then
+    service_data_permissions || return 1
+  fi
 }
 
-acquire_lock() {
-  local start_time now
-  init_storage
-
-  if [ "${LOCK_HELD}" = true ]; then
-    return 0
+prepare_lock_path() {
+  local parent
+  parent="$(dirname -- "${LOCK_FILE}")"
+  [ ! -L "$parent" ] && [ ! -L "${LOCK_FILE}" ] || return 1
+  if [ ! -d "$parent" ]; then
+    ensure_dir_mode "$parent" 700 || return 1
+  elif [ "$parent" = "${LOCK_ROOT}" ]; then
+    [ "$(stat -c %u "$parent")" = "${EUID}" ] || return 1
+    chmod 700 "$parent" || return 1
   fi
+}
 
-  start_time="$(date +%s)"
-  if command_exists flock; then
-    exec {LOCK_FD}>"${LOCK_FILE}"
-    while ! flock -n "${LOCK_FD}"; do
-      now="$(date +%s)"
-      if [ $((now - start_time)) -ge "${LOCK_TIMEOUT}" ]; then
-        fatal "在 ${LOCK_TIMEOUT} 秒内无法获取锁。"
-      fi
-      sleep 1
-    done
-  else
-    while ! mkdir "${LOCK_DIR_FALLBACK}" 2>/dev/null; do
-      now="$(date +%s)"
-      if [ $((now - start_time)) -ge "${LOCK_TIMEOUT}" ]; then
-        fatal "在 ${LOCK_TIMEOUT} 秒内无法获取锁。"
-      fi
-      # 陈旧锁自愈：持有 mkdir 锁的进程死亡不会自动释放，
-      # 锁目录年龄超过 4 倍超时即判定为残留并强制清除
-      local lock_age
-      lock_age="$(stat -c %Y "${LOCK_DIR_FALLBACK}" 2>/dev/null || printf 0)"
-      now="$(date +%s)"
-      if [ "$((now - lock_age))" -gt "$((LOCK_TIMEOUT * 4))" ]; then
-        print_warn "检测到陈旧锁目录，强制清除：${LOCK_DIR_FALLBACK}"
-        rm -rf "${LOCK_DIR_FALLBACK}"
-        continue
-      fi
-      sleep 1
-    done
+close_lock_fd() {
+  if [[ "${LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
+    exec {LOCK_FD}>&-
   fi
+  LOCK_FD=""
+}
 
-  LOCK_HELD=true
+forget_inherited_lock() {
+  if [ "${LOCK_HELD:-false}" = true ] && [ "${LOCK_OWNER_PID:-}" != "${BASHPID}" ]; then
+    # flock -u would unlock the parent's shared open-file description.
+    close_lock_fd
+    LOCK_HELD=false
+    LOCK_OWNER_PID=""
+  fi
+}
+
+lock_process_identity() {
+  local pid="$1" stat_line boot rest
+  local -a _lock_stat_fields
+  [ -r "/proc/$pid/stat" ] || return 1
+  IFS= read -r stat_line <"/proc/$pid/stat" || return 1
+  rest="${stat_line##*) }"
+  read -r -a _lock_stat_fields <<<"$rest"
+  [ "${#_lock_stat_fields[@]}" -ge 20 ] || return 1
+  IFS= read -r boot </proc/sys/kernel/random/boot_id || return 1
+  printf '%s:%s' "$boot" "${_lock_stat_fields[19]}"
+}
+
+try_mkdir_lock() {
+  local owner identity current self="${BASHPID}"
+  if ! mkdir -- "${LOCK_DIR_FALLBACK}" 2>/dev/null; then
+    # No age-based eviction: a long-running live owner keeps its lock.
+    [ -f "${LOCK_DIR_FALLBACK}/owner" ] && [ ! -L "${LOCK_DIR_FALLBACK}/owner" ] || return 1
+    read -r owner identity <"${LOCK_DIR_FALLBACK}/owner" || return 1
+    [[ "$owner" =~ ^[1-9][0-9]*$ ]] || return 1
+    current="$(lock_process_identity "$owner" 2>/dev/null || true)"
+    if kill -0 "$owner" 2>/dev/null && { [ -z "$identity" ] || [ "$identity" = "$current" ]; }; then
+      return 1
+    fi
+    # One reaper at a time; never recursively remove a lock path another owner may reuse.
+    mkdir "${LOCK_DIR_FALLBACK}/reap" 2>/dev/null || return 1
+    if [ "$(<"${LOCK_DIR_FALLBACK}/owner")" != "$owner $identity" ]; then
+      rmdir "${LOCK_DIR_FALLBACK}/reap" 2>/dev/null || true
+      return 1
+    fi
+    rm -- "${LOCK_DIR_FALLBACK}/owner" || return 1
+    rmdir "${LOCK_DIR_FALLBACK}/reap" || return 1
+    rmdir "${LOCK_DIR_FALLBACK}" 2>/dev/null || return 1
+    mkdir -- "${LOCK_DIR_FALLBACK}" 2>/dev/null || return 1
+  fi
+  identity="$(lock_process_identity "$self" 2>/dev/null || true)"
+  if ! printf '%s %s\n' "${BASHPID}" "$identity" >"${LOCK_DIR_FALLBACK}/owner"; then
+    rmdir "${LOCK_DIR_FALLBACK}" 2>/dev/null || true
+    return 1
+  fi
 }
 
 try_acquire_lock() {
-  init_storage
-
-  if [ "${LOCK_HELD}" = true ]; then
-    return 0
-  fi
-
+  forget_inherited_lock
+  [ "${LOCK_HELD:-false}" != true ] || return 0
+  prepare_lock_path || return 1
   if command_exists flock; then
-    exec {LOCK_FD}>"${LOCK_FILE}" || return 1
-    if ! flock -n "${LOCK_FD}" 2>/dev/null; then
-      eval "exec ${LOCK_FD}>&-" 2>/dev/null || true
-      LOCK_FD=""
+    exec {LOCK_FD}>>"${LOCK_FILE}" || return 1
+    chmod 600 "${LOCK_FILE}" || { close_lock_fd; return 1; }
+    if ! flock -n "${LOCK_FD}"; then
+      close_lock_fd
       return 1
     fi
   else
-    mkdir "${LOCK_DIR_FALLBACK}" 2>/dev/null || return 1
+    try_mkdir_lock || return 1
   fi
-
   LOCK_HELD=true
-  return 0
+  LOCK_OWNER_PID="${BASHPID}"
+}
+
+acquire_lock() {
+  local started="${SECONDS}"
+  [[ "${LOCK_TIMEOUT}" =~ ^[0-9]+$ ]] || return 1
+  while ! try_acquire_lock; do
+    if [ $((SECONDS - started)) -ge "${LOCK_TIMEOUT}" ]; then
+      print_err "在 ${LOCK_TIMEOUT} 秒内无法获取锁。"
+      return 1
+    fi
+    sleep 1
+  done
 }
 
 release_lock() {
-  if [ "${LOCK_HELD}" != true ]; then
+  [ "${LOCK_HELD:-false}" = true ] || return 0
+  if [ "${LOCK_OWNER_PID:-}" != "${BASHPID}" ]; then
+    forget_inherited_lock
     return 0
   fi
-
-  if command_exists flock && [ -n "${LOCK_FD}" ]; then
+  if [ -n "${LOCK_FD:-}" ]; then
     flock -u "${LOCK_FD}" || true
-    eval "exec ${LOCK_FD}>&-"
-    LOCK_FD=""
+    close_lock_fd
   else
+    rm -f -- "${LOCK_DIR_FALLBACK}/owner"
     rmdir "${LOCK_DIR_FALLBACK}" 2>/dev/null || true
   fi
-
   LOCK_HELD=false
+  LOCK_OWNER_PID=""
 }
 
 json_update() {
   local file="$1"
   shift
   local tmp
-  tmp="$(mktemp "${BASE_DIR}/.json.XXXXXX")"
+  validate_json_object "$file" || return 1
+  tmp="$(mktemp "${file}.tmp.XXXXXX")" || return 1
   if ! jq "$@" "$file" >"${tmp}"; then
     rm -f "${tmp}"
     return 1
@@ -151,7 +222,7 @@ json_set_record() {
   local tag="$2"
   local json="$3"
   # shellcheck disable=SC2016
-  json_update "$file" --arg tag "$tag" --argjson value "$json" '.[$tag] = $value'
+  json_update "$file" --arg tag "$tag" --argjson value "$json" '.[$tag] = $value' || return 1
   invalidate_port_caches_if_defined
 }
 
@@ -159,7 +230,7 @@ json_delete_record() {
   local file="$1"
   local tag="$2"
   # shellcheck disable=SC2016
-  json_update "$file" --arg tag "$tag" 'del(.[$tag])'
+  json_update "$file" --arg tag "$tag" 'del(.[$tag])' || return 1
   invalidate_port_caches_if_defined
 }
 
@@ -169,7 +240,7 @@ json_set_field() {
   local field="$3"
   local value="$4"
   # shellcheck disable=SC2016
-  json_update "$file" --arg tag "$tag" --arg field "$field" --arg value "$value" '.[$tag][$field] = $value'
+  json_update "$file" --arg tag "$tag" --arg field "$field" --arg value "$value" '.[$tag][$field] = $value' || return 1
   invalidate_port_caches_if_defined
 }
 
@@ -214,89 +285,289 @@ node_meta_bulk() {
 
 delete_node_records() {
   local tag="$1"
-  json_delete_record "${NODES_FILE}" "$tag"
-  json_delete_record "${SECRETS_FILE}" "$tag"
+  json_delete_record "${NODES_FILE}" "$tag" || return 1
+  json_delete_record "${SECRETS_FILE}" "$tag" || return 1
 }
 
 reconcile_state() {
-  local tag
+  # Finish both reads before changing either table; jq errors never mean "absent".
+  validate_storage_tables || return 1
+  local nodes_tags secret_tags tag present
+  nodes_tags="$(iter_node_tags)" || return 1
+  secret_tags="$(jq -r 'keys[]' "${SECRETS_FILE}")" || return 1
   while IFS= read -r tag; do
-    [ -n "${tag}" ] || continue
-    if ! jq -e --arg tag "${tag}" 'has($tag)' "${SECRETS_FILE}" >/dev/null 2>&1; then
-      print_warn "对账：节点 ${tag} 缺少密钥记录，已移除。"
-      json_delete_record "${NODES_FILE}" "${tag}"
+    [ -n "$tag" ] || continue
+    present="$(jq -r --arg tag "$tag" 'has($tag)' "${SECRETS_FILE}")" || return 1
+    if [ "$present" = false ]; then
+      print_warn "对账：节点 $tag 缺少密钥记录，已移除。"
+      json_delete_record "${NODES_FILE}" "$tag" || return 1
     fi
-  done < <(iter_node_tags)
+  done <<<"$nodes_tags"
   while IFS= read -r tag; do
-    [ -n "${tag}" ] || continue
-    if ! jq -e --arg tag "${tag}" 'has($tag)' "${NODES_FILE}" >/dev/null 2>&1; then
-      print_warn "对账：孤儿密钥 ${tag}，已移除。"
-      json_delete_record "${SECRETS_FILE}" "${tag}"
+    [ -n "$tag" ] || continue
+    present="$(jq -r --arg tag "$tag" 'has($tag)' "${NODES_FILE}")" || return 1
+    if [ "$present" = false ]; then
+      print_warn "对账：孤儿密钥 $tag，已移除。"
+      json_delete_record "${SECRETS_FILE}" "$tag" || return 1
     fi
-  done < <(jq -r 'keys[]' "${SECRETS_FILE}" 2>/dev/null | tr -d '\r')
+  done <<<"$secret_tags"
 }
 
 backup_state() {
-  local backup_dir tmpdir f
-  backup_dir="${BASE_DIR}/backups/$(date +%Y%m%d-%H%M%S)-$(printf '%04d' $((RANDOM % 10000)))-$$"
-  ensure_dir_mode "${BASE_DIR}/backups" 700
+  local backup_dir tmpdir f old i j links
+  local -a files=("${NODES_FILE}" "${SECRETS_FILE}" "${CONFIG_FILE}" "${SETTING_FILE}")
+  local -a names=(nodes.json secrets.json config.yaml settings.json) backups=()
+  validate_storage_tables || return 1
+  validate_json_object "${SETTING_FILE}" || return 1
+  ensure_dir_mode "${BASE_DIR}/backups" 700 || return 1
   tmpdir="$(mktemp -d "${BASE_DIR}/backups/.staging.XXXXXX")" || return 1
-  mkdir -p "${tmpdir}/certs" && chmod 700 "${tmpdir}/certs"
-
-  for f in nodes.json secrets.json config.yaml settings.json; do
-    [ -f "${BASE_DIR}/${f}" ] && cp "${BASE_DIR}/${f}" "${tmpdir}/${f}" && chmod 600 "${tmpdir}/${f}"
+  backup_dir="${BASE_DIR}/backups/$(date +%Y%m%d-%H%M%S)-${BASHPID}-${tmpdir##*.}"
+  if ! mkdir "$tmpdir/certs"; then rm -rf -- "$tmpdir"; return 1; fi
+  for i in "${!files[@]}"; do
+    f="${files[$i]}"
+    if [ ! -f "$f" ] || [ -L "$f" ] ||
+      ! cp -- "$f" "$tmpdir/${names[$i]}" || ! chmod 600 "$tmpdir/${names[$i]}"; then
+      rm -rf -- "$tmpdir"
+      return 1
+    fi
   done
-  # 证书/私钥（仅当存在）一并纳入，恢复时可完整回滚
   if [ -d "${CERT_DIR}" ]; then
-    find "${CERT_DIR}" -maxdepth 1 -type f \( -name '*.crt' -o -name '*.key' \) -exec cp {} "${tmpdir}/certs/" \; 2>/dev/null || true
+    links="$(find "${CERT_DIR}" -type l -print -quit)" || { rm -rf -- "$tmpdir"; return 1; }
+    if [ -n "$links" ] || ! cp -a "${CERT_DIR}/." "$tmpdir/certs/"; then
+      rm -rf -- "$tmpdir"
+      return 1
+    fi
   fi
-  chmod 700 "${BASE_DIR}/backups" 2>/dev/null || true
-  if ! mv "${tmpdir}" "${backup_dir}"; then
-    rm -rf "${tmpdir}"
+  # MANIFEST.sha256 is explicitly excluded from the file scan.
+  # shellcheck disable=SC2094
+  if ! (cd "$tmpdir" && find . -type f ! -name MANIFEST.sha256 -exec sha256sum {} + >MANIFEST.sha256) ||
+    ! chmod -R go-rwx "$tmpdir" || ! mv -- "$tmpdir" "$backup_dir"; then
+    rm -rf -- "$tmpdir"
     return 1
   fi
+  # Never prune the snapshot backing an in-flight transaction.
+  for old in "${BASE_DIR}/backups/"[0-9]*; do
+    if [ ! -d "$old" ] || [ -L "$old" ]; then continue; fi
+    j=${#backups[@]}
+    while [ "$j" -gt 0 ] && [ "$old" -ot "${backups[$((j-1))]}" ]; do
+      backups[j]="${backups[$((j-1))]}"
+      j=$((j-1))
+    done
+    backups[j]="$old"
+  done
+  for ((i=0; i<${#backups[@]}-10; i++)); do
+    [ "${backups[$i]}" = "$backup_dir" ] || [ "${backups[$i]}" = "${_AUTO_ROLLBACK_DIR:-}" ] ||
+      rm -rf -- "${backups[$i]}" || return 1
+  done
+  printf '%s' "$backup_dir"
+}
 
-  find "${BASE_DIR}/backups" -mindepth 1 -maxdepth 1 ! -name '.staging.*' -type d 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -rf
-  printf '%s' "${backup_dir}"
+# Validate a published backup before changing live state. Raw recovery images never
+# enter the dated backup list and are not accepted through this public interface.
+validate_state_backup() {
+  local snapshot="$1" links
+  [ -d "$snapshot" ] && [ ! -L "$snapshot" ] || return 1
+  [ ! -e "$snapshot/.raw-state-v1" ] && [ ! -L "$snapshot/.raw-state-v1" ] || return 1
+  validate_storage_tables "$snapshot/nodes.json" "$snapshot/secrets.json" || return 1
+  validate_json_object "$snapshot/settings.json" || return 1
+  [ -f "$snapshot/config.yaml" ] && [ ! -L "$snapshot/config.yaml" ] || return 1
+  [ -d "$snapshot/certs" ] && [ ! -L "$snapshot/certs" ] || return 1
+  links="$(find "$snapshot" -type l -print -quit)" || return 1
+  [ -z "$links" ] || return 1
+  if [ -e "$snapshot/MANIFEST.sha256" ]; then
+    [ -f "$snapshot/MANIFEST.sha256" ] || return 1
+    (cd "$snapshot" && sha256sum -c MANIFEST.sha256 >/dev/null) || return 1
+  fi
+}
+
+# A private, checksummed image of exact bytes and absence, even if JSON is broken.
+# Five fixed presence bits describe the four state files followed by certificates.
+quarantine_state() {
+  local image f i bits='' links
+  local -a files=("${NODES_FILE}" "${SECRETS_FILE}" "${CONFIG_FILE}" "${SETTING_FILE}")
+  local -a names=(nodes.json secrets.json config.yaml settings.json)
+  image="$(mktemp -d "${BASE_DIR}/.quarantine.XXXXXX")" || return 1
+  for i in "${!files[@]}"; do
+    f="${files[$i]}"
+    if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then
+      rm -rf -- "$image"; return 1
+    fi
+    if [ -f "$f" ]; then
+      if ! cp -p -- "$f" "$image/${names[$i]}"; then rm -rf -- "$image"; return 1; fi
+      bits+="1"
+    else
+      bits+="0"
+    fi
+  done
+  if [ -L "${CERT_DIR}" ] || { [ -e "${CERT_DIR}" ] && [ ! -d "${CERT_DIR}" ]; }; then
+    rm -rf -- "$image"; return 1
+  fi
+  if [ -d "${CERT_DIR}" ]; then
+    links="$(find "${CERT_DIR}" -type l -print -quit)" || { rm -rf -- "$image"; return 1; }
+    if [ -n "$links" ] || ! cp -a -- "${CERT_DIR}" "$image/certs"; then
+      rm -rf -- "$image"; return 1
+    fi
+    bits+="1"
+  else
+    bits+="0"
+  fi
+  # MANIFEST.sha256 is explicitly excluded from the file scan.
+  # shellcheck disable=SC2094
+  if ! printf '%s\n' raw-state-v1 >"$image/.raw-state-v1" ||
+    ! printf '%s\n' "$bits" >"$image/PRESENCE" ||
+    ! (cd "$image" && find . -type f ! -name MANIFEST.sha256 -exec sha256sum {} + >MANIFEST.sha256) ||
+    ! chmod -R go-rwx "$image"; then
+    rm -rf -- "$image"; return 1
+  fi
+  printf '%s' "$image"
+}
+
+validate_raw_state() {
+  local image="$1" bits links i
+  local -a names=(nodes.json secrets.json config.yaml settings.json certs)
+  [ -d "$image" ] && [ ! -L "$image" ] || return 1
+  for i in .raw-state-v1 PRESENCE MANIFEST.sha256; do
+    [ -f "$image/$i" ] && [ ! -L "$image/$i" ] || return 1
+  done
+  [ "$(<"$image/.raw-state-v1")" = raw-state-v1 ] || return 1
+  bits="$(<"$image/PRESENCE")"
+  [[ "$bits" =~ ^[01]{5}$ ]] || return 1
+  links="$(find "$image" -type l -print -quit)" || return 1
+  [ -z "$links" ] || return 1
+  for i in "${!names[@]}"; do
+    if [ "${bits:$i:1}" = 1 ]; then
+      if [ "$i" -eq 4 ]; then [ -d "$image/${names[$i]}" ] || return 1
+      else [ -f "$image/${names[$i]}" ] || return 1; fi
+    else
+      [ ! -e "$image/${names[$i]}" ] || return 1
+    fi
+  done
+  (cd "$image" && sha256sum -c MANIFEST.sha256 >/dev/null) || return 1
+}
+
+# Both valid backups and raw quarantine use this single staged publish/revert path.
+# Until every publish succeeds, previous files and the old certificate tree remain
+# under stage/previous. A failed reversal retains that stage for manual recovery.
+restore_state_image() {
+  local snapshot="$1" raw="${2:-false}" stage f i bits=11111 failed=0 revert_failed=0
+  local -a files=("${NODES_FILE}" "${SECRETS_FILE}" "${CONFIG_FILE}" "${SETTING_FILE}")
+  local -a names=(nodes.json secrets.json config.yaml settings.json)
+  if [ "$raw" = true ]; then
+    validate_raw_state "$snapshot" || return 1
+    bits="$(<"$snapshot/PRESENCE")"
+  else
+    validate_state_backup "$snapshot" || return 1
+  fi
+  stage="$(mktemp -d "${BASE_DIR}/.restore.XXXXXX")" || return 1
+  if ! mkdir "$stage/previous"; then rm -rf -- "$stage"; return 1; fi
+  if [ "${bits:4:1}" = 1 ]; then
+    if ! mkdir "$stage/new-certs" || ! cp -a "$snapshot/certs/." "$stage/new-certs/"; then
+      rm -rf -- "$stage"; return 1
+    fi
+  fi
+  for i in "${!files[@]}"; do
+    f="${files[$i]}"
+    if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then
+      rm -rf -- "$stage"; return 1
+    fi
+    if [ "${bits:$i:1}" = 1 ]; then
+      if ! cp -- "$snapshot/${names[$i]}" "$stage/${names[$i]}" || ! chmod 600 "$stage/${names[$i]}"; then
+        rm -rf -- "$stage"; return 1
+      fi
+    fi
+    if [ -e "$f" ] && ! cp -p -- "$f" "$stage/previous/${names[$i]}"; then
+      rm -rf -- "$stage"; return 1
+    fi
+  done
+  if [ -L "${CERT_DIR}" ] || { [ -e "${CERT_DIR}" ] && [ ! -d "${CERT_DIR}" ]; }; then
+    rm -rf -- "$stage"; return 1
+  fi
+  if [ -e "${CERT_DIR}" ] && ! mv -- "${CERT_DIR}" "$stage/previous/certs"; then
+    rm -rf -- "$stage"; return 1
+  fi
+  if [ "${bits:4:1}" = 1 ] && ! mv -- "$stage/new-certs" "${CERT_DIR}"; then
+    if [ -d "$stage/previous/certs" ] && ! mv -- "$stage/previous/certs" "${CERT_DIR}"; then
+      print_err "证书恢复失败，原证书保留在 $stage/previous/certs"
+      return 1
+    fi
+    rm -rf -- "$stage"; return 1
+  fi
+  for i in "${!files[@]}"; do
+    if [ "${bits:$i:1}" = 1 ]; then
+      if ! mv -- "$stage/${names[$i]}" "${files[$i]}"; then failed=1; break; fi
+    elif ! rm -f -- "${files[$i]}"; then failed=1; break
+    fi
+  done
+  if [ "$failed" -eq 0 ]; then
+    invalidate_port_caches_if_defined || failed=1
+    # Raw absence is deliberate; normal sanitization would recreate missing dirs.
+    if [ "$raw" != true ] && ! sanitize_permissions; then failed=1; fi
+  fi
+  if [ "$failed" -ne 0 ]; then
+    for i in "${!files[@]}"; do
+      if [ -f "$stage/previous/${names[$i]}" ]; then
+        cp -p -- "$stage/previous/${names[$i]}" "${files[$i]}" || revert_failed=1
+      else
+        rm -f -- "${files[$i]}" || revert_failed=1
+      fi
+    done
+    if ! rm -rf -- "${CERT_DIR}"; then revert_failed=1
+    elif [ -d "$stage/previous/certs" ]; then
+      mv -- "$stage/previous/certs" "${CERT_DIR}" || revert_failed=1
+    fi
+    print_err "快照发布失败，暂存及原状态保留在 $stage（回退失败：$revert_failed）"
+    return 1
+  fi
+  if ! rm -rf -- "$stage"; then
+    print_err "状态已发布，但暂存目录清理失败：$stage"
+    return 1
+  fi
+}
+
+restore_state_backup() {
+  restore_state_image "$1" false || return 1
+  print_ok "已从备份恢复：$1"
+}
+
+restore_raw_state() {
+  restore_state_image "$1" true
+}
+
+latest_state_backup() {
+  local candidate latest=""
+  for candidate in "${BASE_DIR}/backups/"[0-9]*; do
+    if [ ! -d "$candidate" ] || [ -L "$candidate" ]; then continue; fi
+    if [ -z "$latest" ] || [ "$candidate" -nt "$latest" ]; then latest="$candidate"; fi
+  done
+  [ -n "$latest" ] || { print_err "没有可用的状态备份。"; return 1; }
+  printf '%s' "$latest"
 }
 
 restore_latest_backup() {
-  local latest f
-  latest="$(find "${BASE_DIR}/backups" -mindepth 1 -maxdepth 1 ! -name '.staging.*' -type d 2>/dev/null | sort | tail -n 1)"
-  if [ -z "${latest}" ]; then
-    print_err "没有可用的状态备份。"
-    return 1
-  fi
-  for f in nodes.json secrets.json config.yaml settings.json; do
-    if [ -f "${latest}/${f}" ]; then
-      cp "${latest}/${f}" "${BASE_DIR}/${f}" && chmod 600 "${BASE_DIR}/${f}"
-    fi
-  done
-  # 一并恢复证书/私钥（若该快照含 certs/），使自签/自定义证书节点完整可回滚
-  if [ -d "${latest}/certs" ]; then
-    ensure_dir_mode "${CERT_DIR}" 700
-    local cf
-    for cf in "${latest}/certs/"*.crt "${latest}/certs/"*.key; do
-      [ -f "${cf}" ] || continue
-      if cp "${cf}" "${CERT_DIR}/" 2>/dev/null; then
-        chmod 600 "${CERT_DIR}/$(basename "${cf}")" 2>/dev/null || true
-      fi
-    done
-  fi
-  print_ok "已从备份恢复：${latest}"
+  local latest
+  latest="$(latest_state_backup)" || return 1
+  restore_state_backup "$latest"
 }
 
 rotate_log_file() {
   local file="$1"
   local size max_bytes idx
 
+  [ ! -L "$file" ] || return 1
+  [ -e "$file" ] || return 0
   [ -f "$file" ] || return 1
-  size="$(wc -c <"$file" 2>/dev/null | tr -d '[:space:]')"
+  [[ "${LOG_ROTATE_SIZE_MB}" =~ ^[1-9][0-9]*$ ]] &&
+    [[ "${LOG_ROTATE_BACKUPS}" =~ ^[0-9]+$ ]] || return 1
+  # Never follow a backup symlink while running as root.
+  for ((idx=1; idx<=LOG_ROTATE_BACKUPS; idx++)); do
+    [ ! -L "${file}.${idx}" ] || return 1
+  done
+  size="$(wc -c <"$file" 2>/dev/null | tr -d '[:space:]')" || return 1
   [ -n "$size" ] || return 1
 
   max_bytes=$((LOG_ROTATE_SIZE_MB * 1024 * 1024))
   if [ "$size" -lt "$max_bytes" ]; then
-    return 1
+    return 0
   fi
 
   if [ "${LOG_ROTATE_BACKUPS}" -le 0 ]; then
@@ -305,7 +576,7 @@ rotate_log_file() {
     return 0
   fi
 
-  rm -f "${file}.${LOG_ROTATE_BACKUPS}"
+  rm -f "${file}.${LOG_ROTATE_BACKUPS}" || return 1
 
   if [ "${LOG_ROTATE_BACKUPS}" -gt 1 ]; then
     idx=$((LOG_ROTATE_BACKUPS - 1))

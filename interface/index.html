@@ -194,8 +194,8 @@
     <button id="theme-btn" class="theme-btn" title="切换深色/浅色模式">☀️</button>
     <h1>Mihomo-Manager 🧰 一键SSH命令生成器<span class="ver">__VERSION__</span></h1>
     <p>
-      项目地址：<a href="https://github.com/famintt/Mihomo-Manager" target="_blank">github.com/famintt/Mihomo-Manager</a>
-      　|　其他命令查询：<a href="https://pkg.tbbbk.com/" target="_blank">pkg.tbbbk.com</a>（Linux 应用安装器 · 180+ 应用一键安装命令）
+      项目地址：<a href="https://github.com/famintt/Mihomo-Manager" target="_blank" rel="noopener noreferrer">github.com/famintt/Mihomo-Manager</a>
+      　|　其他命令查询：<a href="https://pkg.tbbbk.com/" target="_blank" rel="noopener noreferrer">pkg.tbbbk.com</a>（Linux 应用安装器 · 180+ 应用一键安装命令）
     </p>
   </header>
 
@@ -337,6 +337,7 @@
           </div>
         </div>
         <div id="ws-custom-cert" style="display:none">
+        <p class="note" id="ws-cert-validation" role="status" aria-live="polite"></p>
         <div class="row" id="row-ws-cert-content">
           <label>源站证书（PEM，仅自定义） <span class="pill">cert</span></label>
           <textarea id="ws_cert_content" rows="5" placeholder="粘贴 PEM 证书全文，如：&#10;-----BEGIN CERTIFICATE-----&#10;MIIE...&#10;-----END CERTIFICATE-----"></textarea>
@@ -398,9 +399,9 @@
           <div class="ctl">
             <select id="advanced-net" class="has-hint">
               <option value="" selected>不展开（使用默认值）</option>
-              <option value="on">展开：内核调优 / TUIC 0-RTT / DNS</option>
+              <option value="on">展开：内核调优 / DNS</option>
             </select>
-            <span class="hint-inline">默认 net_tune=1、0-RTT=1、DNS 关闭</span>
+            <span class="hint-inline">默认 net_tune=1；DNS 留空使用内置加密 DNS，填写 off/none/0/false/disabled 可关闭</span>
           </div>
         </div>
         <div id="advanced-net-extra" style="display:none">
@@ -412,16 +413,9 @@
           </select>
         </div>
         <div class="row">
-          <label>TUIC 0-RTT <span class="pill">tuic_zero_rtt</span></label>
-          <select id="tuic_zero_rtt">
-            <option value="1" selected>1 · 开启（默认，多次建连更快）</option>
-            <option value="0">0 · 关闭（兼容个别受限网络）</option>
-          </select>
-        </div>
-        <div class="row">
           <label>DNS 加密解析 <span class="pill">dns_servers</span></label>
           <div class="ctl">
-            <input type="text" id="dns_servers" placeholder="留空=关闭（默认）；如 https://1.1.1.1/dns-query,https://dns.google/resolve">
+            <input type="text" id="dns_servers" placeholder="留空使用内置加密 DNS；off/none/0/false/disabled 可关闭；也可指定 https://1.1.1.1/dns-query">
           </div>
         </div>
         <div class="row">
@@ -540,7 +534,7 @@
               <label>允许的 IP/CIDR <span class="pill">socks5_ips</span></label>
               <input type="text" id="socks5-ips" placeholder="如 1.2.3.4,10.0.0.0/8,2001:db8::/32">
             </div>
-            <p class="note">多个地址用英文逗号分隔；启用后仅这些来源可访问 SOCKS5 端口。</p>
+            <p class="note">多个地址用英文逗号分隔；启用后仅这些来源可访问 SOCKS5 端口。若防火墙/白名单无法安全应用，服务将拒绝启动。</p>
           </div>
         </div>
       </section>
@@ -554,7 +548,7 @@
               <option value="" selected>不启用固定订阅</option>
               <option value="on">启用 Worker 固定订阅</option>
             </select>
-            <span class="hint-inline">选择后再填域名和 TOKEN</span>
+            <span class="hint-inline">选择后填 HTTPS Worker 地址和两种独立凭据</span>
           </div>
         </div>
         <div id="sub-extra" style="display:none">
@@ -563,14 +557,21 @@
           <input type="text" id="sub-domain" placeholder="如 https://sbsub.example.com 或 https://xxx.workers.dev">
         </div>
         <div class="row">
-          <label>订阅密钥 <span class="pill">sub_token</span></label>
-          <input type="text" id="sub-token" placeholder="sub-worker 的 TOKEN（建议 UUID）">
+          <label>订阅读取凭据 <span class="pill">sub_read_token</span></label>
+          <input type="text" id="sub-read-token" autocomplete="off" placeholder="独立 URL-safe 随机值，至少 22 位">
         </div>
+        <div class="row">
+          <label>设备上报凭据 <span class="pill">sub_report_token</span></label>
+          <input type="text" id="sub-report-token" autocomplete="off" placeholder="与读取凭据不同的随机值，至少 22 位">
+        </div>
+        <div class="row">
+          <label>机器 slug <span class="pill">sub_machine</span></label>
+          <input type="text" id="sub-machine" placeholder="可选；小写字母/数字开头，后续可用 _ -">
+        </div>
+        <p class="note" id="sub-validation" role="status" aria-live="polite"></p>
         <p class="note">
           需先部署
-          <a href="https://github.com/famintt/sub-worker" target="_blank" rel="noopener">sub-worker</a>：
-          创建 KV 绑定 <code>SUBS</code>，设置 Secret <code>TOKEN</code>，再把 Worker 域名和同一个 TOKEN 填到上面两行。
-          两项都填写后才会启用 Worker 订阅；留空则使用原临时订阅模式。
+          <a href="https://github.com/famintt/sub-worker" target="_blank" rel="noopener noreferrer">sub-worker</a>。配置独立的读取与设备上报凭据；管理员凭据只用于 Worker 管理，绝不可填入本表单。旧版共用 TOKEN 的部署不兼容。
         </p>
         </div>
       </section>
@@ -629,7 +630,7 @@
   </div>
 
   <footer>
-    本页面为 <a href="https://github.com/famintt/Mihomo-Manager" target="_blank">famintt/Mihomo-Manager</a> 的一键命令生成辅助界面，仅供学习交流，请遵守所在地法律法规。
+    本页面为 <a href="https://github.com/famintt/Mihomo-Manager" target="_blank" rel="noopener noreferrer">famintt/Mihomo-Manager</a> 的一键命令生成辅助界面，仅供学习交流，请遵守所在地法律法规。
   </footer>
 </div>
 
@@ -637,7 +638,7 @@
 (function () {
   'use strict';
   var $id = function (x) { return document.getElementById(x); };
-  var val = function (x) { var e = $id(x); return e ? String(e.value).trim() : ''; };
+  var val = function (x) { var e = $id(x); return e && !e.disabled ? String(e.value).trim() : ''; };
 
   var RELEASE_BASE = 'https://github.com/famintt/Mihomo-Manager/releases/latest/download/install.sh';
   var RAW_BASE = 'https://raw.githubusercontent.com/famintt/Mihomo-Manager/main/install.sh';
@@ -772,8 +773,9 @@
     if (val('mtp-mode') === 'on') {
       numEnv('mtpt', 'mtpt', envs);
     }
-    // 直连协议端口
-    ['vlrt', 'vxpt', 'wspt', 'tupt', 'anypt', 'hypt'].forEach(function (k) { numEnv(k, k, envs); });
+    // 直连协议端口：关闭/禁用的表单值不进入生成命令
+    ['vlrt', 'vxpt', 'tupt', 'anypt', 'hypt'].forEach(function (k) { numEnv(k, k, envs); });
+    if (val('ws-mode') === 'cdn') numEnv('wspt', 'wspt', envs);
     if (val('socks5-mode') === 'on') {
       numEnv('socks5pt', 'socks5pt', envs);
     }
@@ -788,18 +790,17 @@
     strEnv('uuid', 'uuid', envs);
     strEnv('name', 'name', envs);
     strEnv('passwd', 'passwd', envs);
-    // 高级网络设置：只有展开时才下发；默认保持 net_tune=1、0-RTT=1、DNS 关闭
+    // 高级网络设置：只有展开时才下发；DNS 空值使用加密默认解析器，off/none/0/false/disabled 关闭
     if (val('advanced-net') === 'on') {
       if (val('net_tune') === '0') envs.push(['net_tune', "'0'"]);
-      if (val('tuic_zero_rtt') === '0') envs.push(['tuic_zero_rtt', "'0'"]);
       strEnv('dns_servers', 'dns_servers', envs);
       strEnv('server_ip', 'server_ip', envs);
       strEnv('direct_host', 'direct_host', envs);
       if (val('debug_flag') === '1') envs.push(['debug_flag', "'1'"]);
     }
     // SNI 与 WS
-    strEnv('vl_sni', 'vl_sni', envs);
-    strEnv('vx_sni', 'vx_sni', envs);
+    if (val('vlrt')) strEnv('vl_sni', 'vl_sni', envs);
+    if (val('vxpt')) strEnv('vx_sni', 'vx_sni', envs);
     if ((val('vlrt') || val('vxpt')) && val('reality-key-mode') === 'on') {
       strEnv('reality_private', 'reality-private', envs);
       strEnv('reality_public', 'reality-public', envs);
@@ -818,19 +819,20 @@
         if (certMode === 'custom') {
           var certPem = val('ws_cert_content') || '';
           var keyPem = val('ws_key_content') || '';
-          if (certPem && keyPem) {
-            envs.push(['cert_b64', qv(b64(certPem))]);
-            envs.push(['key_b64', qv(b64(keyPem))]);
-          }
+          var certStatus = $id('ws-cert-validation');
+          var certError = !certPem || !keyPem ? '自定义证书模式必须同时提供证书和私钥。' : '';
+          if (certStatus) certStatus.textContent = certError;
+          if (certError) return '';
+          envs.push(['cert_b64', qv(b64(certPem))]);
+          envs.push(['key_b64', qv(b64(keyPem))]);
         }
       }
     }
-    strEnv('tu_sni', 'tu_sni', envs);
-    strEnv('any_sni', 'any_sni', envs);
-    strEnv('hy_sni', 'hy_sni', envs);
-    // Argo 固定隧道
-    strEnv('agn', 'agn', envs);
-    strEnv('agk', 'agk', envs);
+    if (val('tupt')) strEnv('tu_sni', 'tu_sni', envs);
+    if (val('anypt')) strEnv('any_sni', 'any_sni', envs);
+    if (val('hypt')) strEnv('hy_sni', 'hy_sni', envs);
+    // 固定 Argo 凭据只在 Argo 启用时下发
+    if (val('argo') === 'vlpt') { strEnv('agn', 'agn', envs); strEnv('agk', 'agk', envs); }
     // SOCKS5
     if (val('socks5-mode') === 'on') {
       strEnv('socks5_username', 'socks5-username', envs);
@@ -840,18 +842,43 @@
         strEnv('socks5_ips', 'socks5-ips', envs);
       }
     }
-    // Worker 固定订阅：启用且域名和密钥都填写才下发
-    var subDomain = val('sub-domain');
-    var subToken = val('sub-token');
-    if (val('sub-mode') === 'on' && subDomain && subToken) {
+    // Worker 固定订阅：启用时必须通过完整输入校验，否则不生成可执行命令
+    if (val('sub-mode') === 'on') {
+      var subDomain = val('sub-domain');
+      var readToken = val('sub-read-token');
+      var reportToken = val('sub-report-token');
+      var machine = val('sub-machine');
+      var subError = validateSubConfig(subDomain, readToken, reportToken, machine);
+      var subStatus = $id('sub-validation');
+      if (subStatus) subStatus.textContent = subError;
+      if (subError) return '';
       envs.push(['sub', "'1'"]);
       envs.push(['sub_mode', "'worker'"]);
-      envs.push(['sub_domain', qv(subDomain)]);
-      envs.push(['sub_token', qv(subToken)]);
+      envs.push(['sub_domain', qv(subDomain.replace(/\/$/, ''))]);
+      envs.push(['sub_read_token', qv(readToken)]);
+      envs.push(['sub_report_token', qv(reportToken)]);
+      if (machine) envs.push(['sub_machine', qv(machine)]);
+    } else {
+      var subStatusOff = $id('sub-validation');
+      if (subStatusOff) subStatusOff.textContent = '';
     }
     return wrapCmd(envs, tail);
   }
 
+  function validateSubConfig(domain, readToken, reportToken, machine) {
+    if (!domain || !readToken || !reportToken) return '启用 Worker 订阅时，必须填写 HTTPS 地址和两种独立凭据。';
+    if (!/^https:\/\/[^/?#\\\s]+\/?$/.test(domain)) return '订阅地址必须是 HTTPS origin，只能有一个末尾斜线。';
+    var parsed;
+    try { parsed = new URL(domain); } catch (e) { return '订阅地址无效：请输入 HTTPS Worker origin。'; }
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.search || parsed.hash || (parsed.pathname !== '/' && parsed.pathname !== '')) return '订阅地址必须为 HTTPS origin，不得含路径、查询、片段或用户信息。';
+    if (parsed.port && Number(parsed.port) < 1) return '订阅端口必须在 1 至 65535 之间。';
+    var host = parsed.hostname;
+    if (host.length > 253 || !host.includes('.') || /^\d+(?:\.\d+){3}$/.test(host) || host.split('.').some(function (label) { return !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label); })) return '订阅地址必须使用有效 DNS 主机名。';
+    if (!/^[A-Za-z0-9_-]{22,}$/.test(readToken) || !/^[A-Za-z0-9_-]{22,}$/.test(reportToken)) return '两种凭据必须仅包含 URL-safe 字符，且各至少 22 位。';
+    if (readToken === reportToken) return '读取凭据与上报凭据必须不同。';
+    if (machine && !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(machine)) return '机器 slug 必须符合 [a-z0-9][a-z0-9_-]{0,63}。';
+    return '';
+  }
   function regen() {
     $id('cmd').value = buildSbm();
   }
@@ -859,7 +886,7 @@
   /* ---------------- 状态联动 ---------------- */
   function syncArgo() {
     var on = val('argo') === 'vlpt';
-    $id('argo_pt').disabled = !on;
+    ['argo_cdn_host', 'argo_cdn_port', 'argo_pt', 'agn', 'agk'].forEach(function (id) { var el = $id(id); if (el) el.disabled = !on; });
     var box = $id('argo-extra');
     if (box) box.style.display = on ? '' : 'none';
   }
@@ -907,14 +934,14 @@
   }
   function syncAdvanced() {
     var on = val('advanced-net') === 'on';
-    ['net_tune', 'tuic_zero_rtt', 'dns_servers', 'server_ip', 'direct_host', 'debug_flag'].forEach(function (id) {
+    ['net_tune', 'dns_servers', 'server_ip', 'direct_host', 'debug_flag'].forEach(function (id) {
       var el = $id(id); if (el) el.disabled = !on;
     });
     var box = $id('advanced-net-extra'); if (box) box.style.display = on ? '' : 'none';
   }
   function syncSub() {
     var on = val('sub-mode') === 'on';
-    ['sub-domain', 'sub-token'].forEach(function (id) {
+    ['sub-domain', 'sub-read-token', 'sub-report-token', 'sub-machine'].forEach(function (id) {
       var el = $id(id); if (el) el.disabled = !on;
     });
     var box = $id('sub-extra'); if (box) box.style.display = on ? '' : 'none';
@@ -973,7 +1000,7 @@
     btn.textContent = '🎲';
     btn.title = '填入随机端口（10000-65535）';
     btn.addEventListener('click', function () {
-      if (inp.disabled) inp.disabled = false;
+      if (inp.disabled) return;
       inp.value = randPort();
       regen();
     });
@@ -984,6 +1011,7 @@
   var wspBtn = $id('rand-wspt');
   if (wspBtn) {
     wspBtn.addEventListener('click', function () {
+      if ($id('wspt').disabled) return;
       $id('wspt').value = randPort();
       regen();
     });

@@ -58,7 +58,7 @@ url_encode() {
 }
 
 url_encode_many() {
-  jq -nr --args -- '$ARGS.positional[] | @uri' "$@"
+  jq -nr --args '$ARGS.positional[] | @uri' -- "$@"
 }
 
 generate_uuid() {
@@ -68,7 +68,8 @@ generate_uuid() {
     uuidgen | tr '[:upper:]' '[:lower:]'
   else
     local hex variant
-    hex="$(openssl rand -hex 16)"
+    hex="$(openssl rand -hex 16)" || return 1
+    [[ "$hex" =~ ^[0-9a-fA-F]{32}$ ]] || return 1
     variant="$(printf '%x' "$(((0x${hex:16:1} & 0x3) | 0x8))")"
     printf '%s-%s-%s-%s-%s\n' \
       "${hex:0:8}" \
@@ -85,10 +86,16 @@ generate_hex() {
 }
 
 random_ws_path() {
-  printf '/%s' "$(generate_hex 4)"
+  local hex
+  hex="$(generate_hex 4)" || return 1
+  [[ "$hex" =~ ^[0-9a-fA-F]{8}$ ]] || return 1
+  printf '/%s' "$hex"
 }
 
 generate_tag() {
-  local prefix="$1"
-  printf '%s-%s-%s' "$prefix" "$(date +%s)" "$(generate_hex 4)"
+  local prefix="$1" stamp hex
+  stamp="$(date +%s)" || return 1
+  hex="$(generate_hex 4)" || return 1
+  [[ "$hex" =~ ^[0-9a-fA-F]{8}$ ]] || return 1
+  printf '%s-%s-%s' "$prefix" "$stamp" "$hex"
 }

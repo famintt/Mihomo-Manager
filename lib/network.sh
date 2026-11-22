@@ -3,42 +3,58 @@ set -eEuo pipefail
 
 umask 077
 
-# 9.5：多源探测响应归一化——裸 IP 直接返回，否则优先 grep IPv4/IPv6，再尝试 JSON 字段。
-# 兼容 icanhazip/ipify(裸 IP)、ifconfig.me/ip(裸 IP)、4.ipw.cn(裸 IP)、
-# ip.3322.net(文本)、cip.cc(HTML 文本)、myip.ipip.net(文本"当前 IP：…")。
+# 裸地址、JSON 字段和文本候选共享严格的公网地址检查。
 extract_public_ip() {
-  local raw="$1" m ip
+  local raw="$1" ip
   [ -n "${raw}" ] || return 1
-  # L5：仅去除 CR/LF（多行响应）并裁剪首尾空白，保留内部空白分隔符——
-  # 原先 tr -d ' ' 会把空格分隔的多个 IP（如 "1.2.3.4 5.6.7.8"）拼接成
-  # "1.2.3.45.6.7.8" 这类非法地址，随后被 grep 截段误取成错误 IP。
-  raw="$(printf '%s' "${raw}" | tr -d '\r\n' | sed -e 's/^[[:space:]]\{1,\}//' -e 's/[[:space:]]\{1,\}$//')"
-  if [ -n "${raw}" ] && is_ip_address "${raw}"; then
+  # 换行转分隔符，避免把多行地址拼成另一个合法地址。
+  raw="$(printf '%s' "${raw}" | tr '\r\n' '  ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  if is_ip_address "${raw}" && ! is_private_ip "${raw}"; then
     printf '%s' "${raw}"
     return 0
   fi
-  if command_exists grep; then
-    m="$(printf '%s' "${raw}" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}|(([0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{0,4})' | grep -vE '^(0\.0\.0\.0|::|0::|::0|127\.)' | head -1 2>/dev/null || true)"
-    if [ -n "${m}" ] && is_ip_address "${m}"; then
-      printf '%s' "${m}"
+  if printf '%s' "${raw}" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    while IFS= read -r ip; do
+      if is_ip_address "${ip}" && ! is_private_ip "${ip}"; then
+        printf '%s' "${ip}"
+        return 0
+      fi
+    done < <(printf '%s' "${raw}" | jq -r '[.ip, .IpAddr, .ipaddr, .address, .data] | .[] | select(type == "string")' 2>/dev/null)
+    return 1
+  fi
+  # 保留候选整体而非截取合法前缀；IPv4 映射 IPv6 也不会被拆成公网 IPv4。
+  while IFS= read -r ip; do
+    [[ "${ip}" == *:* || "${ip}" == *.* ]] || continue
+    if is_ip_address "${ip}" && ! is_private_ip "${ip}"; then
+      printf '%s' "${ip}"
       return 0
     fi
-  fi
-  ip="$(printf '%s' "${raw}" | jq -r '.ip // .IpAddr // .ipaddr // .address // .data // empty' 2>/dev/null | tr -d '\r\n' || true)"
-  if [ -n "${ip}" ] && is_ip_address "${ip}" && ! is_private_ip "${ip}"; then
-    printf '%s' "${ip}"
-    return 0
-  fi
+  done < <(printf '%s' "${raw}" | grep -oE '[0-9a-fA-F:.]+' || true)
   return 1
 }
 
 get_public_ip() {
   local ip ipver flag url meta_ip
-  local cached cached_ts now ttl cached_ver
+  local cached cached_ts now ttl cached_ver pin
 
-  if [ -n "${PUBLIC_IP_CACHE}" ]; then
+  if [ -n "${PUBLIC_IP_CACHE}" ] && is_ip_address "${PUBLIC_IP_CACHE}" && ! is_private_ip "${PUBLIC_IP_CACHE}"; then
     printf '%s' "${PUBLIC_IP_CACHE}"
     return 0
+  fi
+  PUBLIC_IP_CACHE=""
+
+  # 显式固定公网地址（settings.json 的 public_ip_pin，或环境变量 MM_PUBLIC_IP）。
+  # 出网经过代理/WARP 的主机，探测到的出口地址并不是入站可达地址；此时必须由用户
+  # 指定真实可达地址。固定值优先于自动探测，且不受 MM_IP_CACHE_TTL 过期影响。
+  pin="${MM_PUBLIC_IP:-$(get_setting "public_ip_pin")}"
+  if [ -n "${pin}" ]; then
+    if is_ip_address "${pin}" && ! is_private_ip "${pin}"; then
+      PUBLIC_IP_CACHE="${pin}"
+      printf '%s' "${PUBLIC_IP_CACHE}"
+      return 0
+    fi
+    print_err "public_ip_pin/MM_PUBLIC_IP 不是合法公网地址：${pin}"
+    return 1
   fi
 
   # 分享链接默认使用 IPv4；全局设置 ip_version 可选 auto(=v4 优先) / 4 / 6
@@ -377,7 +393,7 @@ snapshot_metadata_ports() {
 snapshot_system_ports() {
   [ -n "${_SYSTEM_PORTS:-}" ] && return 0
   if command_exists ss; then
-    _SYSTEM_PORTS="$(ss -ltnuH 2>/dev/null | awk '$1 ~ /^(tcp|tcp6|udp|udp6)$/ { t=$4; sub(/.*:/,"",t); if (t ~ /^[0-9]+$/) print t }' | sort -nu | tr '\n' ' ' || true)"
+    _SYSTEM_PORTS="$(ss -ltnuH 2>/dev/null | awk '$1 ~ /^(tcp|tcp6|udp|udp6)$/ { t=$5; sub(/.*:/,"",t); if (t ~ /^[0-9]+$/) print t }' | sort -nu | tr '\n' ' ' || true)"
   elif command_exists netstat; then
     _SYSTEM_PORTS="$(netstat -lntup 2>/dev/null | awk '$1 ~ /^(tcp|tcp6|udp|udp6)$/ { t=$4; sub(/.*:/,"",t); if (t ~ /^[0-9]+$/) print t }' | sort -nu | tr '\n' ' ' || true)"
   fi
@@ -398,6 +414,8 @@ system_has_port() {
 
 port_available() {
   local port="$1"
+  [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+  (( 10#$port >= 1 && 10#$port <= 65535 )) || return 1
   if metadata_has_port "$port"; then
     return 1
   fi

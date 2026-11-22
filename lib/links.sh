@@ -6,19 +6,19 @@ umask 077
 build_share_link() {
   local tag="$1"
   local public_ip="${2:-}"
-  local protocol name port host uuid password username fp
+  local protocol name port host uuid password username fp direct_host server_ip
   local reality_server public_key short_id ws_path preferred_domain endpoint_domain host_domain tls_server cert_mode ws_mode cdn_port cdn_sni ext certificate_path fp insecure_flag
 
   # 单次 jq 批量取出全部字段（nodes+secrets），替代逐字段 node_value/secret_value
   # 的多次 jq 进程（每次 mm list/sub 对每个节点可省十次左右 jq 启动）
-  node_meta_array "$tag"
+  node_meta_array "$tag" || return 1
   protocol="${NODE_META[0]}"
   name="${NODE_META[1]}"
   port="${NODE_META[2]}"
   uuid="${NODE_META[3]}"
   password="${NODE_META[4]}"
   public_key="${NODE_META[6]}"
-  short_id="${NODE_META[7]}"
+  short_id="${NODE_META[7]%%,*}"
   reality_server="${NODE_META[8]}"
   tls_server="${NODE_META[9]}"
   preferred_domain="${NODE_META[10]}"

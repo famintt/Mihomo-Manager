@@ -28,7 +28,7 @@ vlrt=2083 hypt=2082 name='HK' mm rep      # 已安装时
 | `cdn_host` | CDN 中转连接地址（优选 IP/域名），WS-TLS CDN 使用（Argo 也可回退使用） | `saas.sin.fan` |
 | `argo_cdn_host` | **Argo 专属优选域名**，独立于 `cdn_host`（v0.3.3；留空回退 `cdn_host`） | `cdn_host` |
 | `argo_cdn_port` | **Argo CDN 转发端口**（如 443/2053/2083/2087/2096/8443），独立于 `cdn_port` | `443` |
-| `ws_mode` | WS-TLS 连接方式：`cdn`（经 `cdn_host` 中转）或 `direct` 直连服务器 IP（脚本后端保留，命令行可设）。注意：网页生成器填写 `wspt` 后**强制下发** `ws_mode=cdn` 与 `cert=custom`（未粘贴证书内容时后端回退自签，仍按 Full 模式使用） | `direct` |
+| `ws_mode` | WS-TLS 连接方式：`cdn`（经 `cdn_host` 中转）或 `direct` 直连服务器 IP（脚本后端保留，命令行可设）。网页生成器仅在启用 CDN 且填写 `wspt` 时下发 `ws_mode=cdn`；证书方式按表单选择的 `self`/`custom` 输出，`custom` 必须提供证书与私钥 | `direct` |
 | `cdn_port` | WS-TLS `cdn` 模式使用的 CDN 转发端口（如 443/8443/2053/2096） | `443` |
 | `ws_cdn_cf_host` | ws_cdn 共享 CDN 连接地址（专用前缀，覆盖 `cdn_host`） | `cdn_host` |
 | `ws_cdn_cf_pt` | ws_cdn 共享 CDN 转发端口（专用前缀，覆盖 `cdn_port`） | `cdn_port` |
@@ -45,16 +45,19 @@ vlrt=2083 hypt=2082 name='HK' mm rep      # 已安装时
 | `ws_path` | WS 路径 | 随机 |
 | `up_mbps` `down_mbps` | HY2 带宽 | 200 |
 | `socks5_username` `socks5_password` | SOCKS5 账号 | user / 随机 |
-| `net_tune` | 网络内核调优（BBR+fq+缓冲，自动测速优化参数；`0/off/no` 关闭） | 开启 |
-| `net_tune_region` | 自动优化档位：`asia`（保守）或 `overseas`（大缓冲），未设时按实测延迟自动推断 | 按延迟自动 |
-| `net_tune_bandwidth_mbps` | 显式指定带宽（Mbps），跳过自动测速直接按档位优化 | 自动测速 |
-| `NET_TUNE_SKIP_SPEEDTEST=1` | 跳过自动测速（缺少 speedtest 或网络受限时回退 1000Mbps 档位） | 未设置 |
+| `net_tune` | 网络内核调优（BBR+fq+缓冲，使用显式带宽或已持久化测速值；`0/off/no` 关闭） | 开启 |
+| `net_tune_region` | 优化档位：`asia`（保守）或 `overseas`（大缓冲），未设时按延迟推断 | 按延迟推断 |
+| `net_tune_bandwidth_mbps` | 显式指定带宽（Mbps），跳过测速直接按档位优化 | 未设置 |
+| `NET_TUNE_ALLOW_SPEEDTEST=1` | 显式允许运行 Ookla 测速；交互菜单会先询问，非交互默认不测速 | 未设置 |
+| `NET_TUNE_SKIP_SPEEDTEST=1` | 跳过任何测速；不会清除原有带宽/延迟设置 | 未设置 |
 | `sub` | `sub=1` 启用订阅生成；配合 `sub_mode=worker` 上报到 sub-worker | 关闭 |
 | `sub_mode` | 订阅模式：`worker`（固定 Worker，推荐）或 `temp`（临时隧道，兼容旧用法） | `temp` |
 | `sub_domain` | sub-worker 域名，如 `https://sbsub.example.com` | 空 |
-| `sub_token` | sub-worker 的 `TOKEN`，上报和读取共用 | 空 |
+| `sub_read_token` | Worker 订阅读取凭据；URL-safe 随机值，至少 22 位 | 空 |
+| `sub_report_token` | Worker 设备上报凭据；与读取凭据分离，URL-safe 随机值，至少 22 位 | 空 |
 | `server_ip` | 分享链接使用的服务器 IP；默认自动探测 | 自动 |
 | `direct_host` | 直连协议链接显示的域名，优先于 server_ip/public_ip | 空 |
+| `public_ip_pin` | 固定的公网地址（写入 settings.json）。出网经过代理/WARP 的主机，自动探测到的是出口地址而非入站可达地址，此时必须固定；优先于自动探测与 TTL 缓存，也可用环境变量 MM_PUBLIC_IP 临时覆盖 | 未设置 |
 | `reality_private` / `reality_public` | 固定 Reality 密钥对（必须成对提供） | 自动生成 |
 | `socks5_wl_flag` / `socks5_ips` | Socks5 源地址白名单（iptables；逗号分隔 IP/CIDR） | 关闭 / 空 |
 | `debug_flag` | 调试日志开关（1=debug） | 0 |
@@ -75,7 +78,7 @@ vxpt=5444 vx_sni=pypi.org name='HK' mm rep
 v1.2.4 起 WS-TLS 的 CDN 中转采用 **Cloudflare 证书方案**：源站只有一个 TLS WS inbound（端口 `wspt`），即**统一的回源端口**，不再生成明文 HTTP 回源 inbound、不再依赖 nginx。Cloudflare 边缘 SSL 模式设为 **Full** 或 **Full(Strict)**，以 HTTPS 回源到该 TLS 端口。
 
 - **Full（推荐，默认 `cert=self`）**：源站用内置自签证书（99 年）即可，Cloudflare 边缘→源站全程加密但**不校验**源站证书，无需任何额外文件。
-- Web 生成器“源站证书”默认选中 **自签证书**；只有 Full(Strict) 才需要切到“粘贴证书”并填 Origin CA 证书/私钥。
+- Web 生成器“源站证书”默认选中 **自签证书**；只有 Full(Strict) 才需要切到“粘贴证书”并同时填 Origin CA 证书/私钥。选自定义证书却缺少任一内容时，生成器会阻止命令生成。
 - **Full(Strict)**：Cloudflare 会校验源站证书，需选 `cert=custom`。在 DNS 控制台 SSL/TLS → Origin Server → Create Certificate 生成 **Cloudflare Origin CA 证书**，把证书与私钥全文**直接粘贴**到生成器（自动以 base64 传服务器解码存储），无需先上传文件。
 
 端口关系：客户端连 `cdn_host:cdn_port`（443/2053/2083/2087/2096/8443），SNI/Host 用**必填**的 `ws_cdn_sni`；Cloudflare 收到回源域名后按 SSL 模式把请求以 HTTPS 转发到源站。回源默认目标是 **443**，故建议直接设 `wspt=443`（此时 `wspt` 即统一端口）；若 `wspt` 用其他值，需在 Cloudflare 控制台为该域名添加 **Origin Rule**，把 443 改写为你的 `wspt`。
@@ -107,7 +110,7 @@ mm un        卸载
 
 分享链接默认使用 IPv4；菜单「9. 全局设置」可切换 `v4 / v6 / auto`（仅双栈机器需要调整）。
 
-## 订阅设置（v1.2.7）
+## 订阅设置（v1.3.0）
 
 推荐使用固定 Worker 订阅：管理器生成全部节点链接的 base64，上报到 [sub-worker](https://github.com/famintt/sub-worker)，客户端使用固定域名；服务器重启后订阅 URL 不变。
 
@@ -117,20 +120,23 @@ mm un        卸载
 sub=1 \
 sub_mode=worker \
 sub_domain='https://sbsub.example.com' \
-sub_token='<sub-worker 的 TOKEN>' \
+sub_read_token='<独立随机读取凭据>' \
+sub_report_token='<独立随机上报凭据>' \
+sub_machine='hk1' \
 bash <(curl -fsSL https://github.com/famintt/Mihomo-Manager/releases/latest/download/install.sh) rep
 ```
 
-- `sub_domain` 填 Worker 的自定义域名或 `*.workers.dev` 地址；
-- `sub_token` 只填原始值，不要带引号或 `TOKEN=`；
-- `sub_machine` 可选，默认用 `name` 或主机名生成小写 slug；
+- `sub_domain` 必须是 HTTPS Worker 自定义域名或 `*.workers.dev` origin，可带端口和一个末尾 `/`，不得带路径、查询、片段或用户信息；
+- 使用独立的 `sub_read_token`（仅客户端订阅读取）和 `sub_report_token`（仅设备上报），两者均为 URL-safe 字符且至少 22 位，必须是不同的随机值（建议分别生成至少 128 位随机数）；管理员凭据绝不可填入这里；
+- `sub_machine` 可选，必须匹配 `[a-z0-9][a-z0-9_-]{0,63}`，默认由服务端从 `name` 或主机名生成小写 slug；
+- 旧版共用 `TOKEN` 的 Worker 部署与本版本不兼容；切换前需在 Worker 配置独立读取/上报凭据，并轮换旧共享凭据；
 - 安装完成后会输出：
 
 ```text
-https://sbsub.example.com/sub/<machine>/<TOKEN>
+https://sbsub.example.com/sub/<machine>/<READ_TOKEN>
 ```
 
-- 也支持全量合并地址：`https://sbsub.example.com/sub/<TOKEN>`（不带 `/all`）；
+- 也支持全量合并地址：`https://sbsub.example.com/sub/<READ_TOKEN>`（不带 `/all`）；
 - 相关命令：`mm sub url`、`mm sub status`、`mm sub stop`；
 - Worker 不可达时不会影响 mihomo 节点安装，只打印订阅上报失败警告。
 
@@ -174,21 +180,21 @@ tests/smoke.sh               冒烟测试
 
 - 稳健性：`rep`/`ins`/`delall` 前自动快照到 `backups/`（保留 10 份，目录含唯一后缀，且一并备份自签证书/私钥），`mm restore` 一键回滚；`rep` 在"清空已有节点后"至"提交前"任一环节失败都会自动恢复到安装前状态；watchdog 每轮自动对账清理孤儿记录；Argo 临时域名经公共 DNS（DoH，A/AAAA 任一可解析即通过）发布确认后才写入节点；Argo Token 经环境变量传递，不出现在进程命令行
 - 进程识别：service/watchdog 的存活判断与清理全部做 PID→预期二进制的身份校验（`/proc` 可用时），PID 被复用不会导致漏重启或误杀；临时 Argo 隧道日志每次启动截断，避免旧进程残留域名被误解析
-- 交付韧性：mihomo 固定版本 + SHA256（官方 → 本仓库镜像多源回退）；cloudflared 强校验模型——拿不到官方 SHA256 时默认 **fail-closed 拒绝安装**，绝不静默以"版本自报"代替完整性校验；仅当显式设置 `CLOUDFLARED_ALLOW_RUNTIME_VERIFY=1` 才允许降级（弱网机器的明确选择，不推荐用于生产）
+- 交付韧性：mihomo 固定版本 + SHA256（官方 → 本仓库镜像多源回退）；cloudflared 固定版本并按架构校验 SHA256，禁止动态查询 latest/API 或运行期降级。
 - 低内存：mihomo/cloudflared 按物理内存与 cgroup 上限自动设置 `GOMEMLIMIT` 软上限（防 OOM）；cloudflared 默认 `http2` 模式压内存尖峰；低于 200MB 内存自动提示资源约束
 - 保活：systemd 环境用 service + timer；OpenRC/无 systemd 用 cron + pidfile，cloudflared 异常退出约 1 分钟内自动拉起
 - WS-TLS CDN 证书方案（v1.2.4）：CDN 中转统一单端口（`wspt`=回源端口），Cloudflare SSL 用 Full/Full(Strict) 以 HTTPS 回源；`cert=self` 自签即可支持 Full，`cert=custom` 供 Full(Strict) 用 Cloudflare Origin CA 证书；已废弃 `ws_cdn_origin_port` 明文回源。
 - WS-TLS CDN 证书粘贴式导入（v1.2.5）：`cert=custom` 时界面直接把 PEM 证书/私钥内容粘贴进命令（`cert_b64`/`key_b64`），服务器解码写入托管目录自动加载，无需先上传文件；`cert_path`/`key_path` 文件路径方式保留兼容。
-- 智能网络调优（v1.2.0，吸收 Actions-bbr-v3 思路）：默认启用 `BBR + fq` + 收发缓冲，首次运行时**自动测速**（Ookla speedtest 官方 CLI，自包含安装于管理器目录，可 `NET_TUNE_SKIP_SPEEDTEST=1` 跳过），同时测速并解析**延迟**（v1.2.3），并按带宽档位 + 地区档位（`asia` 保守 / `overseas` 大缓冲，未显式设置时按延迟自动推断）+ **物理内存上限**综合推荐 TCP buffer；交互环境下测速结果会先给用户**确认/覆写**（`NET_TUNE_SKIP_CONFIRM=1` 跳过），确认后结果持久化到 `settings.json`，watchdog 后续轮次直接沿用不再重复测速；补充 `tcp_limit_output_bytes=4MB`、`tcp_slow_start_after_idle=0`；管理菜单新增 **10. BBR+FQ+缓存设置** 可随时重填带宽/延迟并自动重新应用。
-- 安全：`set -eEuo pipefail`、`umask 077`、secrets/证书/pid 全部 600；分享链接 authority 对 IPv6 正确加方括号（不再先做查询参数编码）；`build_share_link` 局部变量隔离（`fp` 不泄漏到全局）
-- CI：shellcheck / bash -n / shfmt / 冒烟测试 / 可复现 bundle 构建 / 版本与 `worker.js` 一致性门禁
+- 智能网络调优（v1.2.0，吸收 Actions-bbr-v3 思路）：默认启用 `BBR + fq` + 收发缓冲，使用显式带宽或已有持久化测速值；只有显式设置 `NET_TUNE_ALLOW_SPEEDTEST=1` 或在交互菜单确认后才运行 Ookla speedtest，非交互默认不测速；测速结果先供用户确认/覆写，再持久化至 `settings.json`，watchdog 后续沿用；按带宽/地区（`asia` 保守、`overseas` 大缓冲）和物理内存上限计算 TCP buffer；补充 `tcp_limit_output_bytes=4MB`、`tcp_slow_start_after_idle=0`。管理菜单 **8. BBR+FQ+缓存设置** 可手动重填或在锁外测速后短时持锁应用；主菜单 **10. 卸载** 会要求确认。
+- 安全：`set -eEuo pipefail`、`umask 077`；管理数据和 PID 文件保持私有，配置与证书仅向专用 Mihomo 账号提供必要只读权限；该账号只能写专用 data 目录。分享链接 authority 对 IPv6 正确加方括号；`build_share_link` 局部变量隔离。
+- CI：Bash 语法、发布入口 ShellCheck、离线发布攻击样例、可复现 bundle 构建、版本/摘要与 `worker.js` 一致性门禁；完整专项和真实核心验收见 [审计整改与验收记录](docs/AUDIT-REMEDIATION.md)。
 - 上游版本见 `metadata/upstream.env`
 
 ## 发布流程
 
 1. 更新代码与 `VERSION`
-2. `bash scripts/build-release-bundle.sh`，将新校验值同步到 `install.sh`
-3. 上传 bundle、checksums.txt、install.sh 到 GitHub Release
+2. 在 Linux 上运行 `bash scripts/build-release-bundle.sh --refresh`，再运行 `bash scripts/check-version.sh --tag v1.2.7`（使用本次声明的 tag）。
+3. 将 `dist/` 中四个文件一起发布：bundle、`checksums.txt`、`install.sh` 和 `install.sh.sha256`。
 
 ### 可选：二进制镜像源
 

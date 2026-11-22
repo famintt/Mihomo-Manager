@@ -3,6 +3,124 @@ set -eEuo pipefail
 
 umask 077
 
+# Linux /proc birth time rejects stale PID records, including zombies. The comm
+# field may contain spaces and parentheses, so remove it before counting fields.
+managed_proc_birth() {
+  local pid="$1" stat
+  local -a fields
+  [[ "${pid}" =~ ^[1-9][0-9]{0,9}$ ]] && [ "${pid}" -gt 1 ] || return 1
+  IFS= read -r stat 2>/dev/null <"/proc/${pid}/stat" || return 1
+  read -r -a fields <<<"${stat##*) }"
+  case "${fields[0]:-}" in '' | Z | X | x) return 1 ;; esac
+  [[ "${fields[19]:-}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "${fields[19]}"
+}
+
+managed_proc_exe() {
+  local pid="$1" binary="$2" actual canonical
+  actual="$(readlink "/proc/${pid}/exe" 2>/dev/null)" || return 1
+  actual="${actual% (deleted)}"
+  canonical="$(readlink -f -- "${binary}" 2>/dev/null)" || canonical="${binary}"
+  [ "${actual}" = "${canonical}" ] || [ "${actual}" = "${binary}" ]
+}
+
+managed_proc_binary_name() {
+  local pid="$1" actual
+  actual="$(readlink "/proc/${pid}/exe" 2>/dev/null)" || return 1
+  actual="${actual% (deleted)}"
+  printf '%s' "${actual##*/}"
+}
+
+# Dynamically scoped output array. Preserve each NUL-separated argument.
+managed_proc_argv() {
+  local pid="$1" arg
+  proc_argv=()
+  while IFS= read -r -d '' arg; do proc_argv+=("${arg}"); done 2>/dev/null <"/proc/${pid}/cmdline"
+  [ "${#proc_argv[@]}" -gt 0 ]
+}
+
+managed_proc_log() {
+  local pid="$1" log="$2" output canonical
+  output="$(readlink "/proc/${pid}/fd/1" 2>/dev/null)" || return 1
+  canonical="$(readlink -f -- "${log}" 2>/dev/null)" || canonical="${log}"
+  [ "${output% (deleted)}" = "${canonical}" ] || [[ "${output% (deleted)}" == "${canonical}".[0-9]* ]]
+}
+
+# Current records include the birth time. A v1.2.7 numeric-only record is
+# accepted only if its binary and role-specific argv also match.
+managed_pid_read() {
+  local file="$1" verify="$2" pid recorded extra birth
+  shift 2
+  [ -f "${file}" ] && [ ! -L "${file}" ] || return 1
+  read -r pid recorded extra <"${file}" || return 1
+  [ -z "${extra}" ] || return 1
+  birth="$(managed_proc_birth "${pid}")" || return 1
+  [ -z "${recorded}" ] || [ "${recorded}" = "${birth}" ] || return 1
+  "${verify}" "${pid}" "$@" && [ "$(managed_proc_birth "${pid}")" = "${birth}" ] || return 1
+  printf '%s %s\n' "${pid}" "${birth}"
+}
+
+managed_pid_stop() {
+  local pid="$1" birth="$2" i
+  [ "$(managed_proc_birth "${pid}")" = "${birth}" ] || return 0
+  kill -TERM "${pid}" 2>/dev/null || [ "$(managed_proc_birth "${pid}")" != "${birth}" ] || return 1
+  for ((i = 0; i < 20; i++)); do
+    [ "$(managed_proc_birth "${pid}")" = "${birth}" ] || return 0
+    sleep 0.1
+  done
+  kill -KILL "${pid}" 2>/dev/null || [ "$(managed_proc_birth "${pid}")" != "${birth}" ] || return 1
+  for ((i = 0; i < 20; i++)); do
+    [ "$(managed_proc_birth "${pid}")" = "${birth}" ] || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+managed_pid_stop_file() {
+  local file="$1" pid birth identity
+  if identity="$(managed_pid_read "$@")"; then
+    read -r pid birth <<<"${identity}"
+    managed_pid_stop "${pid}" "${birth}" || return 1
+  fi
+  rm -f -- "${file}"
+}
+
+# Launch without inheriting the manager flock or the caller's stdout pipe.
+# Record the child as PID + birth before waiting for exec/readiness.
+managed_spawn() {
+  local file="$1" log="$2" pid birth tmp
+  shift 2
+  tmp="$(mktemp "${file}.XXXXXX")" || return 1
+  (
+    local_lock_fd="${LOCK_FD:-}"
+    if [[ "${local_lock_fd}" =~ ^[0-9]+$ ]]; then exec {local_lock_fd}>&-; fi
+    trap '' HUP
+    exec "$@"
+  ) </dev/null >>"${log}" 2>&1 &
+  pid=$!
+  if ! birth="$(managed_proc_birth "${pid}")"; then
+    rm -f -- "${tmp}"
+    return 1
+  fi
+  if ! printf '%s %s\n' "${pid}" "${birth}" >"${tmp}" || ! mv -fT -- "${tmp}" "${file}"; then
+    managed_pid_stop "${pid}" "${birth}" || true
+    rm -f -- "${tmp}"
+    return 1
+  fi
+}
+
+managed_wait_exec() {
+  local file="$1" i pid birth
+  read -r pid birth <"${file}" || return 1
+  for ((i = 0; i < 20; i++)); do
+    [ "$(managed_proc_birth "${pid}")" = "${birth}" ] || return 1
+    managed_pid_read "$@" >/dev/null && return 0
+    sleep 0.1
+  done
+  managed_pid_stop "${pid}" "${birth}" || true
+  return 1
+}
+
 argo_required() {
   [ "$(env_var "argo")" = "vlpt" ] && return 0
   [ -f "${NODES_FILE}" ] && grep -q '"protocol"[[:space:]]*:[[:space:]]*"vless-argo"' "${NODES_FILE}" 2>/dev/null
@@ -18,17 +136,19 @@ wait_for_trycloudflare_domain() {
   local timeout="${2:-60}"
   local interval="${3:-2}"
   # 3.2:可传 cloudflared pid：进程假死/提前退出时立即失败，不等满 timeout（快速失败）
-  local pid="${4:-}"
+  local pid="${4:-}" birth="${5:-}"
+  if [ -n "${pid}" ] && [ -z "${birth}" ]; then birth="$(managed_proc_birth "${pid}")" || return 1; fi
   local elapsed=0
   local domain=""
 
   while [ "${elapsed}" -lt "${timeout}" ]; do
-    if [ -n "${pid}" ] && ! kill -0 "${pid}" 2>/dev/null; then
+    if [ -n "${pid}" ] && [ "$(managed_proc_birth "${pid}")" != "${birth}" ]; then
       print_warn "cloudflared 进程（pid ${pid}）已退出，停止等待临时域名。"
       return 1
     fi
     domain="$(parse_trycloudflare_domain "$log_file" || true)"
     if [ -n "$domain" ]; then
+      [ -z "${pid}" ] || [ "$(managed_proc_birth "${pid}")" = "${birth}" ] || return 1
       printf '%s' "$domain"
       return 0
     fi
@@ -66,17 +186,15 @@ argo_domain_resolvable() {
     # A2：2 源 × A/AAAA 四路并发核验（原串行最坏 4×6s→并行 ≈6s），
     # 语义与原实现一致：任一有记录→已发布；有应答但不含记录→未发布；
     # 全部不可达→fail-open（隧道日志已出现域名即放行，弱网不回滚）。
-    local probe_tmp _f raw _i=0 _any_ok=0 _any_rec=0 _pid
+    local probe_tmp _f raw cnt _i=0 _any_ok=0 _any_rec=0 _pid
     local base_url record_type
     local -a probe_pids=()
     probe_tmp="$(mktemp -d "${BASE_DIR}/.argodoh.XXXXXX" 2>/dev/null || true)"
-    [ -n "${probe_tmp}" ] || probe_tmp="$(mktemp -d 2>/dev/null || true)"
-    [ -n "${probe_tmp}" ] || probe_tmp="${TMPDIR:-/tmp}/argodoh.$$"
-    mkdir -p "${probe_tmp}"
+    [ -n "${probe_tmp}" ] || probe_tmp="$(mktemp -d)" || return 1
     for base_url in "https://1.1.1.1/dns-query?name=${domain}." "https://dns.google/resolve?name=${domain}."; do
       for record_type in A AAAA; do
         (
-          cnt="$(curl -fsS --max-time 6 -H 'accept: application/dns-json' "${base_url}&type=${record_type}" 2>/dev/null | jq -r '[.Answer[]? | select(.type == 1 or .type == 28)] | length' 2>/dev/null || true)"
+          cnt="$(curl -q -fsS --max-time 6 -H 'accept: application/dns-json' "${base_url}&type=${record_type}" 2>/dev/null | jq -r '[.Answer[]? | select(.type == 1 or .type == 28)] | length' 2>/dev/null || true)"
           if [[ "${cnt}" =~ ^[0-9]+$ ]]; then
             printf 'R%s' "${cnt}"
           else
@@ -120,18 +238,17 @@ wait_for_trycloudflare_domain_verified() {
   local log_file="$1"
   local timeout="${2:-60}"
   local retry="${3:-1}"
-  local pid="${4:-}"
+  local pid="${4:-}" birth="${5:-}"
+  if [ -n "${pid}" ] && [ -z "${birth}" ]; then birth="$(managed_proc_birth "${pid}")" || return 1; fi
   local domain attempt
 
   for attempt in 0 1 2; do
     [ "${attempt}" -le "${retry}" ] || break
-    domain="$(wait_for_trycloudflare_domain "${log_file}" "${timeout}" 2 "${pid}" || true)"
+    domain="$(wait_for_trycloudflare_domain "${log_file}" "${timeout}" 2 "${pid}" "${birth}" || true)"
+    [ -z "${pid}" ] || [ "$(managed_proc_birth "${pid}")" = "${birth}" ] || return 1
     [ -n "${domain}" ] || continue
-    if [ "${MM_ARGO_SKIP_DNS_VERIFY:-0}" = "1" ]; then
-      printf '%s' "${domain}"
-      return 0
-    fi
-    if argo_domain_resolvable "${domain}"; then
+    if [ "${MM_ARGO_SKIP_DNS_VERIFY:-0}" = "1" ] || argo_domain_resolvable "${domain}"; then
+      [ -z "${pid}" ] || [ "$(managed_proc_birth "${pid}")" = "${birth}" ] || return 1
       printf '%s' "${domain}"
       return 0
     fi
@@ -194,88 +311,18 @@ argo_edge_ip_version() {
 # 地址后直接建立 TCP 连接。优先解析族内地址 + bash /dev/tcp（不依赖 nc 的 -4/-6，BusyBox
 # nc 不支持族参数）；getent 无族参数（部分 busybox）时以 curl 双保险回退。
 probe_edge_family() {
-  local fam="$1"
-  local ip nflag
-  # getent ahostsv4/ahostsv6 返回"族内全部地址 STREAM/PROTO"行，取首个地址
+  local fam="$1" ip
+  case "${fam}" in 4 | 6) ;; *) return 1 ;; esac
   ip="$(getent "ahostsv${fam}" region1.v2.argotunnel.com 2>/dev/null | awk 'NR==1{print $1}' || true)"
-  if [ -n "${ip}" ]; then
-    if command_exists timeout; then
-      timeout 4 bash -c "exec 3<>/dev/tcp/${ip}/443" >/dev/null 2>&1
-    else
-      bash -c "exec 3<>/dev/tcp/${ip}/443" >/dev/null 2>&1
-    fi
+  if [ -n "${ip}" ] && command_exists timeout; then
+    timeout 4 bash -c 'exec 3<>"/dev/tcp/$1/443"' bash "${ip}" >/dev/null 2>&1
     return $?
   fi
-  # getent 无族参数：退化为不限族的 TCP 握手探测（仅诊断用，不影响已锁定返回族）
-  if command_exists nc; then
-    timeout 4 nc -z -w 3 region1.v2.argotunnel.com 443 >/dev/null 2>&1
+  if [ -n "${ip}" ] && command_exists nc; then
+    nc -z -w 3 "${ip}" 443 >/dev/null 2>&1
     return $?
   fi
-  command_exists curl && curl -fsS --max-time 4 "https://region1.v2.argotunnel.com" >/dev/null 2>&1
-}
-
-cloudflared_latest_release_json() {
-  if [ -n "${CLOUDFLARED_LATEST_CACHE}" ]; then
-    printf '%s' "${CLOUDFLARED_LATEST_CACHE}"
-    return 0
-  fi
-
-  local json
-  json="$(curl -fsSL --retry 3 --retry-delay 2 --max-time 30 -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/cloudflare/cloudflared/releases/latest" 2>/dev/null || true)"
-  [ -n "${json}" ] || return 1
-
-  CLOUDFLARED_LATEST_CACHE="${json}"
-  printf '%s' "${json}"
-}
-
-cloudflared_latest_version() {
-  local json tag jsdelivr_json gtag
-  local cf_tmp gh_file js_file
-  # 首选 GitHub API（含 digest 数据）；不可用时回退 jsdelivr 镜像索引（仅版本号）。
-  # GitHub 与 jsdelivr 并发后台（A2），先到先得，避免串行回退的额外等待；
-  # 都失败才算失败。
-  if [ -n "${CLOUDFLARED_LATEST_CACHE}" ]; then
-    json="${CLOUDFLARED_LATEST_CACHE}"
-  else
-    cf_tmp="$(mktemp -d "${BASE_DIR}/.cfver.XXXXXX" 2>/dev/null || true)"
-    [ -n "${cf_tmp}" ] || cf_tmp="$(mktemp -d 2>/dev/null || true)"
-    [ -n "${cf_tmp}" ] || cf_tmp="${TMPDIR:-/tmp}/cfver.$$"
-    mkdir -p "${cf_tmp}"
-    gh_file="${cf_tmp}/gh"
-    js_file="${cf_tmp}/js"
-    (curl -fsSL --retry 3 --retry-delay 2 --max-time 30 -H "Accept: application/vnd.github+json" \
-      "https://api.github.com/repos/cloudflare/cloudflared/releases/latest" 2>/dev/null || true) >"${gh_file}" &
-    (curl -fsSL --retry 2 --max-time 20 "https://data.jsdelivr.com/v1/package/gh/cloudflare/cloudflared" 2>/dev/null || true) >"${js_file}" &
-    wait || true
-    json="$(tr -d '\r\n' <"${gh_file}" 2>/dev/null || true)"
-    jsdelivr_json="$(tr -d '\r\n' <"${js_file}" 2>/dev/null || true)"
-    rm -rf "${cf_tmp}"
-    [ -n "${json}" ] && CLOUDFLARED_LATEST_CACHE="${json}"
-  fi
-  gtag="$(printf '%s' "${json}" | jq -r '.tag_name // empty' 2>/dev/null || true)"
-  if [ -n "${gtag}" ]; then
-    printf '%s' "${gtag}"
-    return 0
-  fi
-  if [ -n "${jsdelivr_json}" ]; then
-    tag="$(printf '%s' "${jsdelivr_json}" | jq -r '.versions[]? | select(type == "string" and test("^[0-9]{4}\\.[0-9]+\\.[0-9]+$"))' 2>/dev/null | head -n 1 || true)"
-    if [ -n "${tag}" ]; then
-      printf '%s' "${tag}"
-      return 0
-    fi
-  fi
-  return 1
-}
-
-cloudflared_latest_digest() {
-  local asset="$1"
-  local json digest
-  json="$(cloudflared_latest_release_json 2>/dev/null || true)"
-  [ -n "${json}" ] || return 1
-  digest="$(printf '%s' "${json}" | jq -r --arg name "${asset}" '.assets[] | select(.name == $name) | .digest // empty' 2>/dev/null | sed 's/^sha256://')"
-  [ -n "${digest}" ] || return 1
-  printf '%s' "${digest}"
+  command_exists curl && curl -q -fsS "-${fam}" --connect-timeout 3 --max-time 4 "https://region1.v2.argotunnel.com" >/dev/null 2>&1
 }
 
 cloudflared_installed_version() {
@@ -284,87 +331,148 @@ cloudflared_installed_version() {
   printf '%s' "${out#cloudflared version }"
 }
 
-cleanup_argo_pid() {
-  local pid_file="$1"
-  kill_pid_file "$pid_file"
+# Require the installed executable and the command line emitted by this
+# manager. The stdout log associates otherwise identical token tunnels with
+# the right node (and distinguishes subscription tunnels from node tunnels).
+argo_proc_matches() {
+  local pid="$1" log="$2" mode="${3:-}" url="${4:-}" end=5
+  local -a proc_argv
+  managed_proc_exe "${pid}" "${CLOUDFLARED_BIN}" && managed_proc_log "${pid}" "${log}" && managed_proc_argv "${pid}" || return 1
+  [ "${proc_argv[1]:-}" = tunnel ] && [ "${proc_argv[2]:-}" = --no-autoupdate ] &&
+    [ "${proc_argv[3]:-}" = --protocol ] && [ "${proc_argv[4]:-}" = http2 ] || return 1
+  if [ "${proc_argv[5]:-}" = --edge-ip-version ]; then
+    case "${proc_argv[6]:-}" in 4 | 6 | auto) ;; *) return 1 ;; esac
+    end=7
+  fi
+  case "${proc_argv[end]:-}" in
+  run)
+    [ -z "${mode}" ] || [ "${mode}" = token ] || return 1
+    [ "${#proc_argv[@]}" -eq "$((end + 1))" ]
+    ;;
+  --url)
+    [ "${mode}" != token ] && [ "${#proc_argv[@]}" -eq "$((end + 2))" ] || return 1
+    [[ "${proc_argv[end + 1]}" =~ ^http://127\.0\.0\.1:[0-9]{1,5}$ ]] || return 1
+    [ -z "${url}" ] || [ "${proc_argv[end + 1]}" = "${url}" ]
+    ;;
+  *) return 1 ;;
+  esac
+}
+
+argo_spawn() {
+  local file="$1" log="$2" mem
+  shift 2
+  mem="${GOMEMLIMIT:-}"
+  if [ -z "${mem}" ]; then mem="$(go_mem_limit_value)" || return 1; fi
+  if [ -n "${mem}" ]; then
+    GOMEMLIMIT="${mem}" managed_spawn "${file}" "${log}" "${CLOUDFLARED_BIN}" "$@"
+  else
+    managed_spawn "${file}" "${log}" "${CLOUDFLARED_BIN}" "$@"
+  fi
+}
+
+argo_node_running() {
+  local tag="$1" port mode url=""
+  [[ "${tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || return 1
+  mode="$(node_value "${tag}" argo_mode)" || return 1
+  if [ "${mode}" != token ]; then
+    port="$(node_value "${tag}" port)" || return 1
+    url="http://127.0.0.1:${port}"
+  fi
+  managed_pid_read "${RUNTIME_DIR}/${tag}.pid" argo_proc_matches "${LOG_DIR}/${tag}.cloudflared.log" "${mode}" "${url}" >/dev/null
 }
 
 stop_argo_node() {
   local tag="$1"
-  kill_pid_file "${BASE_DIR}/runtime/${tag}.pid" "${CLOUDFLARED_BIN}"
+  [[ "${tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || return 1
+  managed_pid_stop_file "${RUNTIME_DIR}/${tag}.pid" argo_proc_matches "${LOG_DIR}/${tag}.cloudflared.log"
 }
 
+# Mutating callers hold the global lock throughout stop, spawn, and domain
+# publication. Watchdog uses this same path and never installs dependencies.
+
+stop_all_argo_nodes() {
+  local pid_file tag log identity pid birth failed=0
+  [ ! -L "${RUNTIME_DIR}" ] || return 1
+  [ -d "${RUNTIME_DIR}" ] || return 0
+  for pid_file in "${RUNTIME_DIR}"/*.pid; do
+    [ -e "${pid_file}" ] || continue
+    [ -f "${pid_file}" ] && [ ! -L "${pid_file}" ] || continue
+    tag="${pid_file##*/}"; tag="${tag%.pid}"
+    [[ "${tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || continue
+    log="${LOG_DIR}/${tag}.cloudflared.log"
+    [ ! -L "${log}" ] || continue
+    if identity="$(managed_pid_read "${pid_file}" argo_proc_matches "${log}" "" "" 2>/dev/null)"; then
+      read -r pid birth <<<"${identity}"
+      if ! managed_pid_stop "${pid}" "${birth}"; then failed=1; continue; fi
+      rm -f -- "${pid_file}" || failed=1
+    fi
+  done
+  return "${failed}"
+}
 start_argo_node() {
-  local tag="$1"
-  local mode port token log_file pid_file domain edge_ip
-
-  [ -x "${CLOUDFLARED_BIN}" ] || install_cloudflared_bin
-  mode="$(node_value "$tag" "argo_mode")"
-  port="$(node_value "$tag" "port")"
-  log_file="${BASE_DIR}/logs/${tag}.cloudflared.log"
-  pid_file="${BASE_DIR}/runtime/${tag}.pid"
-
-  stop_argo_node "$tag"
-  : >"${log_file}"
-  chmod 600 "${log_file}"
-
-  # token 模式的 endpoint_domain 是安装时提供的不变值：不得清空，
-  # 否则每次服务重启后固定隧道链接会显示"尚未分配"（v0.2.18 回归）
-  if [ "${mode}" != "token" ]; then
-    # 启动前清空旧域名：临时隧道失败时分享链接不再显示失效地址
-    json_set_field "${NODES_FILE}" "${tag}" "endpoint_domain" "" 2>/dev/null || true
+  local tag="$1" mode port token log_file pid_file domain edge_ip pid birth origin=""
+  local -a args
+  [[ "${tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || return 1
+  [ "$(node_value "${tag}" protocol)" = vless-argo ] || return 1
+  mode="$(node_value "${tag}" argo_mode)" || return 1
+  port="$(node_value "${tag}" port)" || return 1
+  if [ "${mode}" != token ]; then
+    [[ "${port}" =~ ^[0-9]{1,5}$ ]] && [ "${port}" -ge 1 ] && [ "${port}" -le 65535 ] || return 1
+    origin="http://127.0.0.1:${port}"
   fi
-
-  edge_ip="$(argo_edge_ip_version)"
-
-  if [ "${mode}" = "token" ]; then
-    token="$(secret_value "$tag" "argo_token")"
-    # token 经环境变量传入，避免明文出现在进程命令行（ps 可见）
-    # --protocol http2：压掉 QUIC 内存尖峰（30-50MB → 25-40MB），小内存机更稳
-    TUNNEL_TOKEN="${token}" nohup "${CLOUDFLARED_BIN}" tunnel --no-autoupdate --protocol http2 --edge-ip-version "${edge_ip}" run \
-      >>"${log_file}" 2>&1 &
-    write_pid_file "${pid_file}" "$!"
-    # L13：token 模式下 cloudflared 全程静默（无 trycloudflare 域名可展示），
-    # 对 endpoint_domain:443 快速探测一次给安装者即时反馈；刚启动时公网解析未就绪
-    # 属正常，仅告警不阻断。
-    if domain="$(node_value "$tag" "endpoint_domain" 2>/dev/null || true)" && [ -n "${domain}" ] && probe_tcp_port "${domain}" 443 3; then
-      print_ok "Argo 固定隧道已启动（${domain}:443 可达）。"
-    else
-      print_warn "Argo 固定隧道进程已拉起${domain:+（域名 ${domain}）}，尚未通过本地 443 探测——公网发布可能需要数十秒，稍后可运行 status 复核。"
-    fi
-    return 0
+  if argo_node_running "${tag}"; then
+    if [ "${mode}" = token ] || [ -n "$(node_value "${tag}" endpoint_domain)" ]; then return 0; fi
   fi
-
-  nohup "${CLOUDFLARED_BIN}" tunnel --no-autoupdate --protocol http2 --edge-ip-version "${edge_ip}" --url "http://127.0.0.1:${port}" \
-    >>"${log_file}" 2>&1 &
-  local _pid=$!
-  write_pid_file "${pid_file}" "${_pid}"
-
-  # 等待域名出现且确认公共 DNS 已发布（DoH 核验，防"看似成功实则不可解析"）；
-  # 传入 pid：进程假死/提前退出时快速失败，不等满 60s 超时
-  if domain="$(wait_for_trycloudflare_domain_verified "${log_file}" 60 1 "${_pid}")"; then
-    if ! json_set_field "${NODES_FILE}" "${tag}" "endpoint_domain" "${domain}"; then
-      cleanup_argo_pid "${pid_file}"
-      return 1
-    fi
-  else
-    cleanup_argo_pid "${pid_file}"
-    json_set_field "${NODES_FILE}" "${tag}" "endpoint_domain" "" 2>/dev/null || true
-    print_err "等待 ${tag} 的临时 Argo 域名超时（含 DNS 发布确认）。"
+  if [ ! -x "${CLOUDFLARED_BIN}" ]; then
+    print_err '缺少 cloudflared，请先安装项目依赖。'
     return 1
   fi
+  log_file="${LOG_DIR}/${tag}.cloudflared.log"
+  pid_file="${RUNTIME_DIR}/${tag}.pid"
+  stop_argo_node "${tag}" || return 1
+  [ ! -L "${log_file}" ] && : >"${log_file}" || return 1
+  if [ "${mode}" != token ]; then
+    json_set_field "${NODES_FILE}" "${tag}" endpoint_domain '' || return 1
+  fi
+  edge_ip="$(argo_edge_ip_version)" || return 1
+  args=(tunnel --no-autoupdate --protocol http2 --edge-ip-version "${edge_ip}")
+  if [ "${mode}" = token ]; then
+    token="$(secret_value "${tag}" argo_token)" && [ -n "${token}" ] || return 1
+    # cloudflared consumes TUNNEL_TOKEN from the environment, never from argv.
+    TUNNEL_TOKEN="${token}" argo_spawn "${pid_file}" "${log_file}" "${args[@]}" run || return 1
+  else
+    argo_spawn "${pid_file}" "${log_file}" "${args[@]}" --url "${origin}" || return 1
+  fi
+  if ! managed_wait_exec "${pid_file}" argo_proc_matches "${log_file}" "${mode}" "${origin}"; then
+    stop_argo_node "${tag}" || true
+    print_err "Argo 进程启动失败，请检查 ${log_file}。"
+    return 1
+  fi
+  if [ "${mode}" = token ]; then
+    return 0
+  fi
+  if read -r pid birth <"${pid_file}" &&
+    domain="$(wait_for_trycloudflare_domain_verified "${log_file}" 60 1 "${pid}" "${birth}")" &&
+    [ "$(node_value "${tag}" protocol)" = vless-argo ] && [ "$(node_value "${tag}" port)" = "${port}" ] &&
+    [ "$(node_value "${tag}" argo_mode)" = "${mode}" ] &&
+    argo_node_running "${tag}" && json_set_field "${NODES_FILE}" "${tag}" endpoint_domain "${domain}"; then
+    return 0
+  fi
+  stop_argo_node "${tag}" || true
+  print_err "无法发布 ${tag} 的临时 Argo 域名。"
+  return 1
 }
 
 restart_all_argo_nodes() {
-  # 9.3:jq 批量化——一次 bulk 拿到全部 (tag, protocol)，替代逐 tag node_value
-  # node_meta_bulk 输出 4 列(key/protocol/port/argo_mode)：用占位列吸收多余字段，
-  # 否则尾列拼接进 protocol 导致永远匹配不上 vless-argo（F-09）
-  local tag protocol _port _argo
-  while IFS=$'\t' read -r tag protocol _port _argo; do
+  local tag tags failed=0
+  tags="$(jq -er 'to_entries | map(select(.value.protocol == "vless-argo") | .key) | .[]?' "${NODES_FILE}")" || {
+    # jq -e reports no matches as failure; distinguish valid empty input.
+    jq -e 'type == "object" and all(.[]; type == "object")' "${NODES_FILE}" >/dev/null || return 1
+    [ -z "${tags}" ] || return 1
+  }
+  while IFS= read -r tag; do
     [ -n "${tag}" ] || continue
-    if [ "${protocol}" = "vless-argo" ]; then
-      # 单个隧道启动失败不影响其余隧道与调用方
-      start_argo_node "$tag" || print_warn "Argo 隧道 ${tag} 启动失败。"
-    fi
-  done < <(node_meta_bulk)
+    if ! start_argo_node "${tag}"; then print_warn "Argo 隧道 ${tag} 启动失败。"; failed=1; fi
+  done <<<"${tags}"
+  return "${failed}"
 }

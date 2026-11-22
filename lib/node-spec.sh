@@ -5,19 +5,36 @@ umask 077
 
 # 环境变量驱动的自动安装规格层：从环境变量解析节点参数（auto_collect_specs 等），
 # 供 node-auto.sh 的 auto_install 编排使用。
-env_port() {
-  local __env_key="$1"
-  local __env_value
-  __env_value="$(env_var "$__env_key")"
-  if [ -z "$__env_value" ]; then
-    return 1
-  fi
-  if ! [[ "$__env_value" =~ ^[0-9]+$ ]] || [ "$__env_value" -lt 1 ] || [ "$__env_value" -gt 65535 ]; then
-    print_warn "环境变量 ${__env_key} 不是有效端口（1-65535）：${__env_value}，已忽略。"
-    return 1
-  fi
-  printf '%s' "$__env_value"
+# 先用字符串约束长度，再去掉前导 0，避免八进制和 Bash 算术溢出。
+_normalize_unsigned_decimal() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]{1,20}$ ]] || return 1
+  value="${value#"${value%%[!0]*}"}"
+  printf '%s' "${value:-0}"
 }
+
+normalize_node_port() {
+  local port
+  port="$(_normalize_unsigned_decimal "$1")" || return 1
+  [ "${#port}" -le 5 ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+  printf '%s' "$port"
+}
+
+# 给 jq 和内核同一个规范的十进制数值。留空保持旧默认，0 明确表示不限速。
+normalize_hy2_mbps() {
+  local rate
+  rate="$(_normalize_unsigned_decimal "${1:-200}")" || return 1
+  # 限制有效数字，避免 jq/内核速率单位换算的整数精度和范围问题。
+  [ "${#rate}" -le 9 ] || return 1
+  printf '%s' "$rate"
+}
+
+env_port() {
+  local __env_key="$1" __env_value
+  __env_value="$(env_var "$__env_key")" || return 1
+  normalize_node_port "$__env_value"
+}
+
 auto_has_node_env() {
   local v
   for v in vlrt vxpt wspt tupt anypt hypt socks5pt argo; do

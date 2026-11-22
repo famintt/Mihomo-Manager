@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-# SOURCE_ROOT 由 mm_load_all 的 mm_module_path 消费（跨文件引用），豁免 SC2034。
+# SOURCE_ROOT 由 mm_load_all 的 mm_module_path 消费。
 # shellcheck disable=SC2034
 set -eEuo pipefail
-
 umask 077
 
-BASE_DIR="/usr/local/etc/mihomo-manager"
-LIB_DIR="/usr/local/lib/mihomo-manager"
-MIHOMO_BIN="/usr/local/bin/mihomo"
-CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
-CONFIG_FILE="${BASE_DIR}/config.yaml"
-RUNTIME_DIR="${BASE_DIR}/runtime"
-LOG_DIR="${BASE_DIR}/logs"
-SERVICE_NAME="mihomo-manager"
-PID_FILE="${RUNTIME_DIR}/mihomo.pid"
+BASE_DIR="${BASE_DIR:-/usr/local/etc/mihomo-manager}"
+LIB_DIR="${LIB_DIR:-/usr/local/lib/mihomo-manager}"
+MIHOMO_BIN="${MIHOMO_BIN:-/usr/local/bin/mihomo}"
+CLOUDFLARED_BIN="${CLOUDFLARED_BIN:-/usr/local/bin/cloudflared}"
+INSTALL_BIN="${INSTALL_BIN:-/usr/local/bin/mm}"
+WATCHDOG_TARGET="${WATCHDOG_TARGET:-${BASE_DIR}/watchdog.sh}"
+UPSTREAM_ENV="${UPSTREAM_ENV:-${LIB_DIR}/upstream.env}"
+SERVICE_NAME="${SERVICE_NAME:-mihomo-manager}"
+WATCHDOG_SERVICE_NAME="${WATCHDOG_SERVICE_NAME:-mihomo-manager-watchdog}"
+WATCHDOG_TIMER_NAME="${WATCHDOG_TIMER_NAME:-mihomo-manager-watchdog.timer}"
+SYSTEMD_SERVICE_FILE="${SYSTEMD_SERVICE_FILE:-/etc/systemd/system/${SERVICE_NAME}.service}"
+SYSTEMD_WATCHDOG_SERVICE_FILE="${SYSTEMD_WATCHDOG_SERVICE_FILE:-/etc/systemd/system/${WATCHDOG_SERVICE_NAME}.service}"
+SYSTEMD_WATCHDOG_TIMER_FILE="${SYSTEMD_WATCHDOG_TIMER_FILE:-/etc/systemd/system/${WATCHDOG_TIMER_NAME}}"
+OPENRC_SERVICE_FILE="${OPENRC_SERVICE_FILE:-/etc/init.d/${SERVICE_NAME}}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_ROOT=""
@@ -29,352 +33,189 @@ else
   exit 1
 fi
 
-if ! mm_load_all; then
+if [ -n "${SOURCE_ROOT}" ] && [ -f "${SOURCE_ROOT}/metadata/upstream.env" ]; then
+  # shellcheck source=../metadata/upstream.env
+  . "${SOURCE_ROOT}/metadata/upstream.env"
+elif [ -f "${UPSTREAM_ENV}" ]; then
+  # shellcheck source=/usr/local/lib/mihomo-manager/upstream.env
+  . "${UPSTREAM_ENV}"
+else
+  echo "未找到 upstream.env。" >&2
   exit 1
 fi
 
+if ! mm_load_all; then
+  exit 1
+fi
+PID_FILE="${PID_FILE:-${RUNTIME_DIR}/mihomo.pid}"
 require_bash4
-setup_common_traps
 
 start_non_systemd_singbox() {
-  if [ ! -x "${MIHOMO_BIN}" ] || [ ! -f "${CONFIG_FILE}" ]; then
-    return 0
+  [ -x "${MIHOMO_BIN}" ] && [ -f "${CONFIG_FILE}" ] || return 1
+  service_data_permissions || return 1
+  mihomo_validate "${CONFIG_FILE}" || { print_err "配置校验失败，拒绝启动 mihomo。"; return 1; }
+  stop_mihomo_pid_file || return 1
+  socks5_whitelist_apply || return 1
+  local data safe pid launch_birth
+  data="$(mihomo_data_dir)" || return 1
+  safe="$(mihomo_safe_paths)" || return 1
+  rotate_log_file "${LOG_DIR}/mihomo.log" || return 1
+  (
+    if [[ "${LOCK_FD:-}" =~ ^[0-9]+$ ]]; then exec {LOCK_FD}>&-; fi
+    trap '' HUP
+    mihomo_exec_as_user "${safe}" "${MIHOMO_BIN}" -d "${data}" -f "${CONFIG_FILE}"
+  ) </dev/null >>"${LOG_DIR}/mihomo.log" 2>&1 &
+  pid=$!
+  launch_birth="$(managed_proc_birth "${pid}" 2>/dev/null)" || { print_err "无法确认 watchdog 候选 mihomo 进程身份。"; return 1; }
+  if ! write_mihomo_pid_file "${pid}"; then
+    stop_mihomo_candidate "${pid}" "${launch_birth}" || print_err "无法确认 watchdog 候选 mihomo 已停止。"
+    return 1
   fi
-
-  if ! "${MIHOMO_BIN}" -t -f "${CONFIG_FILE}" >/dev/null 2>&1; then
-    print_warn "配置校验失败，已跳过 mihomo 重启。"
-    return 0
-  fi
-
-  rotate_log_file "${LOG_DIR}/mihomo.log" || true
-  local mem_limit
-  mem_limit="$(go_mem_limit_value)"
-  local env_prefix=()
-  if [ -n "${mem_limit}" ]; then
-    env_prefix+=(GOMEMLIMIT="${mem_limit}")
-  fi
-  # P5：GOGC=off 在 standalone（无 systemd/openrc）场景同样生效
-  if go_gc_requested; then
-    env_prefix+=(GOGC="off")
-  fi
-  if [ "${#env_prefix[@]}" -gt 0 ]; then
-    nohup env "${env_prefix[@]}" "${MIHOMO_BIN}" run -d "${BASE_DIR}" -f "${CONFIG_FILE}" >>"${LOG_DIR}/mihomo.log" 2>&1 &
-  else
-    nohup "${MIHOMO_BIN}" run -d "${BASE_DIR}" -f "${CONFIG_FILE}" >>"${LOG_DIR}/mihomo.log" 2>&1 &
-  fi
-  write_pid_file "${PID_FILE}" "$!"
 }
 
 ensure_log_rotation() {
-  rotate_log_file "${LOG_DIR}/mihomo.log" || true
-  # cloudflared 节点日志同样按大小轮转，防止长期运行无上限增长
-  local lf
+  local logs lf
+  rotate_log_file "${LOG_DIR}/mihomo.log" || return 1
+  logs="$(find "${LOG_DIR}" -type f -name '*.cloudflared.log' -print 2>/dev/null)" || return 1
   while IFS= read -r lf; do
     [ -n "${lf}" ] || continue
-    rotate_log_file "${lf}" || true
-  done < <(find "${LOG_DIR}" -type f -name '*.cloudflared.log' 2>/dev/null)
-  # mihomo 缓存库（cache.db，位于 -d 工作目录）超阈值直接清空（重建代价低）
-  local cache_file cache_size
-  cache_file="${BASE_DIR}/cache.db"
-  if [ -f "${cache_file}" ]; then
-    cache_size="$(wc -c <"${cache_file}" 2>/dev/null | tr -d '[:space:]')"
-    if [ -n "${cache_size}" ] && [ "${cache_size}" -gt $((LOG_ROTATE_SIZE_MB * 1024 * 1024)) ]; then
-      rm -f "${cache_file}"
-      print_warn "cache.db 超过 ${LOG_ROTATE_SIZE_MB}MB，已清空重建。"
-    fi
-  fi
+    rotate_log_file "${lf}" || return 1
+  done <<< "${logs}"
+  # cache.db belongs to the live Mihomo data directory; never unlink it here.
 }
 
-# 5.2：数据面健康判定——TCP 任一可探活即健康；全 UDP / 混合部署在进程存活前提下
-# 额外旁路 UDP(QUIC) 端口绑定探测（TCP 探活对 hy2/tuic 无意义）：
-#   UDP 节点存在且全部未绑定 → 假活；status=2(全 UDP) 且绑定正常 → 健康。
 singbox_healthy() {
-  local status=0 udp_cnt
-  # set -e 下用 || 捕获探活退出码，防止假死/不适用时提前退出
-  singbox_probe_status || status=$?
-  [ "${status}" = 0 ] && return 0
-  udp_cnt="$(udp_node_count)"
-  if [ "${udp_cnt}" -gt 0 ]; then
-    if any_udp_port_bound; then
-      return 0
-    fi
+  local pid status=0
+  if systemd_available; then
+    pid="$(systemctl show -p MainPID --value "${SERVICE_NAME}" 2>/dev/null || true)"
+    [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  elif openrc_available; then
+    rc-service "${SERVICE_NAME}" status >/dev/null 2>&1 || return 1
+  else
+    pid="$(read_mihomo_pid_file 2>/dev/null || true)"
+    [ -n "${pid}" ] && mihomo_process_matches "${pid}" || return 1
+  fi
+  verify_data_plane_ready
+}
+
+restart_singbox() {
+  if systemd_available; then
+    systemctl restart "${SERVICE_NAME}" >/dev/null 2>&1 || return 1
+  elif openrc_available; then
+    rc-service "${SERVICE_NAME}" restart >/dev/null 2>&1 || rc-service "${SERVICE_NAME}" start >/dev/null 2>&1 || return 1
+  else
+    start_non_systemd_singbox || return 1
+  fi
+  if ! verify_data_plane_ready; then
+    stop_service || true
+    print_err "mihomo 重启后数据面未就绪，已停止候选进程。"
     return 1
   fi
-  [ "${status}" = 2 ] && return 0
-  return 1
 }
 
-# P2：数据面探活失败计数与升级——按 MM_PROBE_FAIL_LIMIT（默认 3）
-# 允许达 N 次连续失败后才强制重启（失败计数在下一轮探活成功时清零）。
-# 三态语义见 singbox_probe_status：0=健康、1=假死候选、2=不适用。
 probe_fail_escalate() {
-  local restart_cmd="$1"
-  local probe_fail_file="${RUNTIME_DIR}/probe_fail_count"
-  local probe_fail probe_fail_limit
-  probe_fail_limit="${MM_PROBE_FAIL_LIMIT:-3}"
-  if [ -f "${probe_fail_file}" ]; then
-    probe_fail="$(tr -dc '0-9' <"${probe_fail_file}" 2>/dev/null || true)"
+  local fail_file="${RUNTIME_DIR}/probe_fail_count" fails=0 limit="${MM_PROBE_FAIL_LIMIT:-3}"
+  [[ "${limit}" =~ ^[1-9][0-9]*$ ]] || { print_err "MM_PROBE_FAIL_LIMIT 必须为正整数。"; return 1; }
+  if [ -f "${fail_file}" ] && [ ! -L "${fail_file}" ]; then
+    fails="$(tr -dc '0-9' <"${fail_file}" 2>/dev/null || true)"
+    fails="${fails:-0}"
   fi
-  probe_fail="${probe_fail:-0}"
-  probe_fail=$((probe_fail + 1))
-  printf '%s' "${probe_fail}" >"${probe_fail_file}"
-  chmod 600 "${probe_fail_file}"
-  if [ "${probe_fail}" -lt "${probe_fail_limit}" ]; then
-    print_warn "mihomo 数据面探活失败 ${probe_fail}/${probe_fail_limit} 次，暂不重启（避免瞬断误杀）。"
+  [[ "${fails}" =~ ^[0-9]+$ ]] || fails=0
+  fails=$((fails + 1))
+  printf '%s\n' "${fails}" >"${fail_file}" || return 1
+  chmod 0600 "${fail_file}" || return 1
+  if [ "${fails}" -lt "${limit}" ]; then
+    print_warn "mihomo 数据面连续失败 ${fails}/${limit} 次，暂不重启。"
     return 0
   fi
-  rm -f "${probe_fail_file}"
-  print_warn "mihomo 连续 ${probe_fail} 次数据面探活失败，判定假死，强制重启。"
-  # 1.2：重启前 dump 当前活动连接快照到运行时日志，辅助根因定位
+  rm -f -- "${fail_file}" || return 1
   clash_api_dump_connections || true
-  eval "${restart_cmd}"
+  restart_singbox
 }
 
 ensure_singbox() {
-  if [ ! -x "${MIHOMO_BIN}" ] || [ ! -f "${CONFIG_FILE}" ]; then
+  [ -x "${MIHOMO_BIN}" ] && [ -f "${CONFIG_FILE}" ] || return 0
+  if singbox_healthy; then
+    rm -f -- "${RUNTIME_DIR}/probe_fail_count"
     return 0
   fi
-
-  local pid
-
-  if systemd_available; then
-    if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
-      systemctl restart "${SERVICE_NAME}" >/dev/null 2>&1 || true
-      return 0
-    fi
-    if singbox_healthy; then
-      rm -f "${RUNTIME_DIR}/probe_fail_count"
-      return 0
-    fi
-    probe_fail_escalate "systemctl restart ${SERVICE_NAME} >/dev/null 2>&1 || true"
-    return 0
-  fi
-
-  if openrc_available; then
-    if rc-service "${SERVICE_NAME}" status >/dev/null 2>&1; then
-      if singbox_healthy; then
-        rm -f "${RUNTIME_DIR}/probe_fail_count"
-        return 0
-      fi
-      probe_fail_escalate "rc-service ${SERVICE_NAME} restart >/dev/null 2>&1 || rc-service ${SERVICE_NAME} start >/dev/null 2>&1 || true"
-      return 0
-    fi
-    kill_pid_file "${PID_FILE}" "${MIHOMO_BIN}"
-    rc-service "${SERVICE_NAME}" restart >/dev/null 2>&1 || rc-service "${SERVICE_NAME}" start >/dev/null 2>&1 || true
-    return 0
-  fi
-
-  pid="$(read_pid_file "${PID_FILE}" 2>/dev/null || true)"
-  # 存活且（/proc 可用时）确为 mihomo 实例才认为健康，防止 PID 复用导致漏重启
-  if [ -n "${pid}" ] && pid_matches_binary_or_alive "${pid}" "${MIHOMO_BIN}"; then
-    # S1：进程存活但数据传输面无响应时视为假死候选，按失败计数升级重启；
-    # 全 UDP 部署由 singbox_healthy 的端口绑定旁路判定。
-    if singbox_healthy; then
-      rm -f "${RUNTIME_DIR}/probe_fail_count"
-      return 0
-    fi
-    probe_fail_escalate "rm -f \"${PID_FILE}\"; start_non_systemd_singbox"
-    return 0
-  fi
-
-  rm -f "${PID_FILE}"
-  start_non_systemd_singbox
-}
-
-start_temp_tunnel() {
-  local tag="$1"
-  local local_port pid_file log_file domain edge_ip tmp_pid
-  local_port="$(node_value "$tag" "port")"
-  pid_file="${RUNTIME_DIR}/${tag}.pid"
-  log_file="${LOG_DIR}/${tag}.cloudflared.log"
-
-  : >"${log_file}"
-  chmod 600 "${log_file}"
-  # 截断（非追加）启动：日志只含本次进程内容，避免 parse_trycloudflare_domain
-  # 从上一轮已死的 cloudflared 进程残留中误取旧域名（stale domain）。
-  # 与 mm.sh start_argo_node 的 `: >` 语义一致。
-  # 启动前清空旧域名：隧道失败时分享链接不再显示失效地址。
-  # 用非阻塞 try_acquire_lock：watchdog 场景外层已释放锁，拿不到锁时
-  # 跳过本轮写（与 watchdog 兜底语义一致），绝不在此阻塞占用 watch 周期。
-  if ! try_acquire_lock; then
-    print_warn "无法获取锁，跳过 ${tag} 的临时 Argo 域名清理。"
-    return 1
-  fi
-  json_set_field "${NODES_FILE}" "${tag}" "endpoint_domain" "" 2>/dev/null || true
-  release_lock
-  edge_ip="$(argo_edge_ip_version)"
-  # --protocol http2：压掉 QUIC 内存尖峰；追加模式写入（O_APPEND）避免轮转后稀疏文件
-  nohup "${CLOUDFLARED_BIN}" tunnel --no-autoupdate --protocol http2 --edge-ip-version "${edge_ip}" --url "http://127.0.0.1:${local_port}" \
-    >>"${log_file}" 2>&1 &
-  tmp_pid=$!
-  write_pid_file "${pid_file}" "${tmp_pid}"
-
-  # 域名需通过公共 DNS 发布确认（DoH）才写入节点，防止"看似成功实则不可解析"；
-  # 传入 pid：进程假死/提前退出时快速失败，不等满 60s 超时
-  if domain="$(wait_for_trycloudflare_domain_verified "${log_file}" 60 1 "${tmp_pid}")"; then
-    try_acquire_lock || {
-      kill_pid_file "${pid_file}" "${CLOUDFLARED_BIN}"
-      print_warn "写入 ${tag} 的临时 Argo 域名时无法获取锁，已保留隧道待下轮确认。"
-      return 1
-    }
-    if jq -e --arg tag "$tag" 'has($tag)' "${NODES_FILE}" >/dev/null 2>&1; then
-      if ! json_set_field "${NODES_FILE}" "${tag}" "endpoint_domain" "${domain}"; then
-        kill_pid_file "${pid_file}" "${CLOUDFLARED_BIN}"
-        print_warn "写入 ${tag} 的临时 Argo 域名失败。"
-      fi
-    else
-      kill_pid_file "${pid_file}" "${CLOUDFLARED_BIN}"
-    fi
-    release_lock
-  else
-    kill_pid_file "${pid_file}" "${CLOUDFLARED_BIN}"
-    try_acquire_lock || {
-      print_warn "等待 ${tag} 的临时 Argo 域名超时，且无法获取锁清除旧域名。"
-      return 1
-    }
-    json_set_field "${NODES_FILE}" "${tag}" "endpoint_domain" "" 2>/dev/null || true
-    release_lock
-    print_warn "等待 ${tag} 的临时 Argo 域名超时（含 DNS 发布确认），已清除旧域名。"
-  fi
-}
-
-start_token_tunnel() {
-  local tag="$1"
-  local token pid_file log_file edge_ip
-  token="$(secret_value "$tag" "argo_token")"
-  if [ -z "${token}" ]; then
-    print_warn "节点 ${tag} 的 Argo Token 为空，已跳过启动。"
-    return 0
-  fi
-  pid_file="${RUNTIME_DIR}/${tag}.pid"
-  log_file="${LOG_DIR}/${tag}.cloudflared.log"
-
-  : >"${log_file}"
-  chmod 600 "${log_file}"
-  edge_ip="$(argo_edge_ip_version)"
-  # token 经环境变量传入，避免明文出现在进程命令行（ps 可见）
-  TUNNEL_TOKEN="${token}" nohup "${CLOUDFLARED_BIN}" tunnel --no-autoupdate --protocol http2 --edge-ip-version "${edge_ip}" run \
-    >>"${log_file}" 2>&1 &
-  write_pid_file "${pid_file}" "$!"
+  probe_fail_escalate
 }
 
 ensure_argo_nodes() {
-  local tag protocol mode pid_file pid
-  local restarts last_restart now backoff restart_at_file
+  local rows tag protocol port mode fail=0
   [ -f "${NODES_FILE}" ] || return 0
-  [ -x "${CLOUDFLARED_BIN}" ] || return 0
-
-  # 9.3：jq 批量化——一次 bulk 拿到全部 (tag, protocol, argo_mode)，替代逐 tag node_value
-  # node_meta_bulk 输出 4 列(key/protocol/port/argo_mode)：port 用占位列吸收，
-  # 否则 mode 拿到的仍是 port，token 节点会被当临时隧道重启（F-09）
-  while IFS=$'\t' read -r tag protocol _port mode; do
+  rows="$(node_meta_bulk)" || { print_err "无法读取 Argo 节点元数据。"; return 1; }
+  while IFS=$'\t' read -r tag protocol port mode; do
     [ -n "${tag}" ] || continue
-    [ "${protocol}" = "vless-argo" ] || continue
-
-    pid_file="${RUNTIME_DIR}/${tag}.pid"
-    pid="$(read_pid_file "${pid_file}" 2>/dev/null || true)"
-    # 存活且（/proc 可用时）确为 cloudflared 实例才跳过重启，防止 PID 复用漏拉起
-    if [ -n "${pid}" ] && pid_matches_binary_or_alive "${pid}" "${CLOUDFLARED_BIN}"; then
-      # 5.4：token 固定隧道做健康探活（endpoint_domain:443）；临时隧道不探（域名属云端分配）
-      if [ "${mode}" = "token" ]; then
-        if probe_token_tunnel "${tag}"; then
-          reset_restart_count "${tag}"
-        fi
-      else
-        # 隧道长时间稳定运行：清零崩溃计数，避免旧失败影响后续退避
-        reset_restart_count "${tag}"
-      fi
-      continue
+    [ "${protocol}" = vless-argo ] || continue
+    if [ "${mode}" = token ] && argo_node_running "${tag}"; then
+      probe_token_tunnel "${tag}" || true
     fi
-
-    # S2：崩溃退避——按 2^(n-1) 秒退避（封顶 30min），防止崩溃循环秒级重启风暴
-    restarts="$(read_restart_count "$tag")"
-    if [ "${restarts}" -gt 0 ]; then
-      backoff="$(argo_backoff_delay "${restarts}")"
-      restart_at_file="${RUNTIME_DIR}/${tag}.restart_at"
-      if [ -f "${restart_at_file}" ]; then
-        last_restart="$(tr -dc '0-9' <"${restart_at_file}" 2>/dev/null | head -c 12 || true)"
-        last_restart="${last_restart:-0}"
-        now="$(date +%s 2>/dev/null || echo 0)"
-        if [ -n "${now}" ] && [ $((now - last_restart)) -lt "${backoff}" ]; then
-          print_warn "节点 ${tag} 处于退避窗口（第 ${restarts} 次崩溃，${backoff}s 内不再重启）。"
-          continue
-        fi
-      fi
+    if ! start_argo_node "${tag}"; then
+      print_warn "Argo 隧道 ${tag} 检查或启动失败。"
+      fail=1
     fi
-
-    rm -f "${pid_file}"
-    if [ "${mode}" = "token" ]; then
-      if start_token_tunnel "${tag}"; then
-        bump_restart_count "${tag}"
-        date +%s >"${RUNTIME_DIR}/${tag}.restart_at" 2>/dev/null || true
-      fi
-    else
-      release_lock
-      if start_temp_tunnel "${tag}"; then
-        # 临时隧道启动即记录，成功与否由下轮域名核验/进程存活清空计数
-        bump_restart_count "${tag}"
-        date +%s >"${RUNTIME_DIR}/${tag}.restart_at" 2>/dev/null || true
-      fi
-      try_acquire_lock || true
-    fi
-  done < <(node_meta_bulk)
+  done <<< "${rows}"
+  return "${fail}"
 }
 
-# 5.4：token 固定隧道的健康探活——endpoint_domain:443 连不上且连续
-# MM_TUNNEL_PROBE_LIMIT（默认 2）轮失败即 kill 进程，交由退避重启路径拉起。
 probe_token_tunnel() {
-  local tag="$1"
-  local domain fail_file fails
-  domain="$(node_value "$tag" "endpoint_domain")"
+  local tag="$1" domain fail_file fails limit="${MM_TUNNEL_PROBE_LIMIT:-2}"
+  domain="$(node_value "${tag}" endpoint_domain)" || return 1
   [ -n "${domain}" ] || return 0
   if probe_tcp_port "${domain}" 443 3; then
-    rm -f "${RUNTIME_DIR}/${tag}.tunnel_probe_fail"
+    rm -f -- "${RUNTIME_DIR}/${tag}.tunnel_probe_fail"
     return 0
   fi
+  [[ "${limit}" =~ ^[1-9][0-9]*$ ]] || return 1
   fail_file="${RUNTIME_DIR}/${tag}.tunnel_probe_fail"
   fails="$(tr -dc '0-9' <"${fail_file}" 2>/dev/null || true)"
   fails="${fails:-0}"
+  [[ "${fails}" =~ ^[0-9]+$ ]] || fails=0
   fails=$((fails + 1))
-  printf '%s' "${fails}" >"${fail_file}"
-  chmod 600 "${fail_file}" 2>/dev/null || true
-  if [ "${fails}" -ge "${MM_TUNNEL_PROBE_LIMIT:-2}" ]; then
-    print_warn "token 隧道 ${tag} 连续 ${fails} 轮探活失败（${domain}:443 不可达），判定假活，准备退避重启。"
-    rm -f "${fail_file}"
-    kill_pid_file "${RUNTIME_DIR}/${tag}.pid" "${CLOUDFLARED_BIN}"
+  printf '%s\n' "${fails}" >"${fail_file}" || return 1
+  chmod 0600 "${fail_file}" || return 1
+  if [ "${fails}" -ge "${limit}" ]; then
+    rm -f -- "${fail_file}" || return 1
+    stop_argo_node "${tag}" || return 1
     return 1
   fi
-  print_warn "token 隧道 ${tag} 第 ${fails}/${MM_TUNNEL_PROBE_LIMIT:-2} 轮探活失败（${domain}:443 不可达）。"
   return 0
 }
 
-# 5.5：minimal metrics——每轮 watchdog 追加一行 jsonl（探活三态，秒级时间戳），
-# 供运维排障回溯探活失败窗口；超过 5MB 裁为 backups 仅留最近一份。
 write_metrics_line() {
-  local ts probe=0 sz
+  local ts probe=0 file="${RUNTIME_DIR}/metrics.jsonl" size
   ts="$(date +%s 2>/dev/null || printf 0)"
-  # F1：set -e 下必须用 || 捕获探活退出码，否则探活失败（1/2）时整行被吞，指标永不落盘
   singbox_probe_status || probe=$?
-  printf '{"ts":%s,"probe":%s}\n' "${ts}" "${probe}" >>"${RUNTIME_DIR}/metrics.jsonl" 2>/dev/null || true
-  sz="$(wc -c <"${RUNTIME_DIR}/metrics.jsonl" 2>/dev/null | tr -d '[:space:]' || printf 0)"
-  if [ -n "${sz}" ] && [ "${sz}" -gt 5242880 ]; then
-    mv "${RUNTIME_DIR}/metrics.jsonl" "${RUNTIME_DIR}/metrics.jsonl.1" 2>/dev/null || true
+  [ ! -L "${file}" ] || return 1
+  printf '{"ts":%s,"probe":%s}\n' "${ts}" "${probe}" >>"${file}" || return 1
+  size="$(wc -c <"${file}" 2>/dev/null | tr -d '[:space:]')" || return 1
+  if [ "${size:-0}" -gt 5242880 ]; then
+    rotate_log_file "${file}" || return 1
   fi
 }
 
-require_root
-require_bash4
-init_storage
-sanitize_permissions
-# 拿不到锁说明另一实例正在工作：静默跳过本轮，不报错
-if ! try_acquire_lock; then
-  exit 0
+watchdog_main() {
+  require_root || return 1
+  require_bash4 || return 1
+  if ! try_acquire_lock; then
+    print_warn "watchdog 无法获取全局锁，本轮不做任何状态写入。"
+    return 1
+  fi
+  setup_common_traps
+  init_storage || return 1
+  sanitize_permissions || return 1
+  ensure_log_rotation || return 1
+  reconcile_state || return 1
+  ensure_singbox || return 1
+  ensure_argo_nodes || return 1
+  ensure_sub || return 1
+  write_metrics_line || return 1
+  sanitize_permissions || return 1
+  release_lock
+}
+
+if [ "${MM_TEST_MODE:-0}" != 1 ]; then
+  watchdog_main "$@"
 fi
-ensure_log_rotation
-reconcile_state || true
-ensure_singbox
-ensure_argo_nodes
-ensure_sub || true
-write_metrics_line
-sanitize_permissions
-release_lock

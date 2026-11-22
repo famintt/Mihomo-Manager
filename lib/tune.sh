@@ -31,12 +31,16 @@ get_tcp_buffer_cap_mb() {
 
 calculate_net_tune_buffer_mb() {
   local bandwidth="$1" region="$2" cap_mb
-  cap_mb="$(get_tcp_buffer_cap_mb)"
+  cap_mb="$(get_tcp_buffer_cap_mb)" || return 1
+  [[ "${cap_mb}" =~ ^[1-9][0-9]{0,2}$ ]] && ((cap_mb <= 64)) || return 1
   local buffer_mb=16
   bandwidth="${bandwidth%.*}"
-  if ! [[ "${bandwidth}" =~ ^[0-9]+$ ]] || ((bandwidth <= 0)); then
+  if [[ "${bandwidth}" =~ ^[0-9]{1,8}$ ]]; then
+    bandwidth="$((10#${bandwidth}))"
+  else
     bandwidth=1000
   fi
+  ((bandwidth > 0)) || bandwidth=1000
   if [ "${region}" = "overseas" ]; then
     if ((bandwidth < 500)); then
       buffer_mb=16
@@ -60,8 +64,47 @@ calculate_net_tune_buffer_mb() {
   printf '%s' "${buffer_mb}"
 }
 
+# Only these two manager files are ours. A name alone is not ownership proof;
+# retain symlinks, non-regular files and same-named files without our header.
+net_tune_owned_file() {
+  local file="$1" first
+  [ -f "${file}" ] && [ ! -L "${file}" ] || return 1
+  IFS= read -r first <"${file}" || return 1
+  case "${first}" in '# mihomo-manager net_tune'* ) return 0 ;; *) return 1 ;; esac
+}
+
+net_tune_write_config() (
+  local name="$1" dir="${SYSCTL_D_DIR:-/etc/sysctl.d}" target tmp
+  case "${name}" in 99-mihomo-manager-net-tune.conf | 98-mihomo-manager-net-tune-extra.conf) ;; *) return 1 ;; esac
+  [ -d "${dir}" ] && [ ! -L "${dir}" ] && [ -w "${dir}" ] || return 1
+  target="${dir}/${name}"
+  if [ -e "${target}" ] || [ -L "${target}" ]; then net_tune_owned_file "${target}" || return 1; fi
+  tmp="$(mktemp "${dir}/.${name}.XXXXXX" 2>/dev/null)" || return 1
+  trap 'rm -f -- "${tmp}"' EXIT
+  cat >"${tmp}" && chmod 0644 "${tmp}" && mv -f -- "${tmp}" "${target}"
+)
+
+remove_net_tune() {
+  local dir="${SYSCTL_D_DIR:-/etc/sysctl.d}" name file status=0
+  [ -e "${dir}" ] || [ -L "${dir}" ] || return 0
+  [ -d "${dir}" ] && [ ! -L "${dir}" ] || return 1
+  for name in 99-mihomo-manager-net-tune.conf 98-mihomo-manager-net-tune-extra.conf; do
+    file="${dir}/${name}"
+    if [ -e "${file}" ] || [ -L "${file}" ]; then
+      if net_tune_owned_file "${file}"; then
+        rm -f -- "${file}" || status=1
+      else
+        print_warn "保留未经确认归本项目所有的调优文件：${file}"
+        status=1
+      fi
+    fi
+  done
+  return "${status}"
+}
+
 apply_sysctls() {
   local buffer_bytes="$1" k v ok=true err=""
+  [[ "${buffer_bytes}" =~ ^[1-9][0-9]{0,7}$ ]] && ((buffer_bytes <= 67108864)) || return 1
   local -a pairs=(
     net.core.rmem_max "${buffer_bytes}"
     net.core.wmem_max "${buffer_bytes}"
@@ -107,22 +150,25 @@ apply_sysctls() {
     err="${err}tcp_limit_output_bytes "
   }
 
-  if [ -d /etc/sysctl.d ] && [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; then
-    {
-      echo "# mihomo-manager net_tune（v1.2.1 智能网络调优，重启后自动加载）"
-      echo "net.core.rmem_max=${buffer_bytes}"
-      echo "net.core.wmem_max=${buffer_bytes}"
-      echo "net.core.default_qdisc=fq"
-      echo "net.ipv4.tcp_congestion_control=bbr"
-      echo "net.ipv4.tcp_rmem=4096 87380 ${buffer_bytes}"
-      echo "net.ipv4.tcp_wmem=4096 65536 ${buffer_bytes}"
-      echo "net.ipv4.tcp_limit_output_bytes=4194304"
-      echo "net.ipv4.tcp_slow_start_after_idle=0"
-    } >"/etc/sysctl.d/99-mihomo-manager-net-tune.conf" 2>/dev/null
+  local persisted=false
+  if [ "${ok}" = true ] && net_tune_write_config 99-mihomo-manager-net-tune.conf <<EOF
+# mihomo-manager net_tune（重启后自动加载）
+net.core.rmem_max=${buffer_bytes}
+net.core.wmem_max=${buffer_bytes}
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_rmem=4096 87380 ${buffer_bytes}
+net.ipv4.tcp_wmem=4096 65536 ${buffer_bytes}
+net.ipv4.tcp_limit_output_bytes=4194304
+net.ipv4.tcp_slow_start_after_idle=0
+EOF
+  then
+    persisted=true
   fi
 
   if [ "${ok}" = "true" ]; then
-    print_ok "已应用网络调优：BBR + fq + $((buffer_bytes / 1024 / 1024))MB 缓冲（tcp_limit_output_bytes=4MB、slow_start_after_idle=0），并已持久化到 /etc/sysctl.d/。"
+    print_ok "已应用网络调优：BBR + fq + $((buffer_bytes / 1024 / 1024))MB 缓冲（tcp_limit_output_bytes=4MB、slow_start_after_idle=0）。"
+    if [ "${persisted}" = true ]; then print_ok "已持久化网络调优。"; else print_warn "持久化目录不可写/不存在或文件归属未确认；仅对当前运行生效。"; fi
   else
     print_warn "net_tune：sysctl 写入/回读校验失败（${err}），可能容器或精简内核限制不可调。"
   fi
@@ -170,26 +216,18 @@ apply_sysctls_extra() {
     fi
   fi
 
-  if [ -d /etc/sysctl.d ] && [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; then
-    {
-      echo "# mihomo-manager net_tune：连接生命周期/并发/路径（v1.4.0+，重启后自动加载）"
-      echo "net.core.rmem_default=262144"
-      echo "net.core.wmem_default=262144"
-      echo "net.core.netdev_max_backlog=5000"
-      echo "net.core.somaxconn=4096"
-      echo "net.ipv4.tcp_notsent_lowat=16384"
-      echo "net.ipv4.tcp_tw_reuse=1"
-      echo "net.ipv4.ip_local_port_range=10000 65535"
-      echo "net.ipv4.tcp_max_syn_backlog=8192"
-      echo "net.ipv4.tcp_mtu_probing=1"
-      if [ -n "${ct_max:-}" ]; then
-        echo "net.netfilter.nf_conntrack_max=${ct_max}"
-      fi
-    } >"/etc/sysctl.d/98-mihomo-manager-net-tune-extra.conf" 2>/dev/null
+  local persisted=false
+  if [ "${ok}" = true ] && {
+    printf '%s\n' '# mihomo-manager net_tune：连接生命周期/并发/路径（重启后自动加载）'
+    for ((i = 0; i < ${#pairs[@]}; i += 2)); do printf '%s=%s\n' "${pairs[i]}" "${pairs[i + 1]}"; done
+    if [ -n "${ct_max:-}" ]; then printf '%s=%s\n' net.netfilter.nf_conntrack_max "${ct_max}"; fi
+  } | net_tune_write_config 98-mihomo-manager-net-tune-extra.conf; then
+    persisted=true
   fi
 
   if [ "${ok}" = "true" ]; then
-    print_ok "已应用连接调优：背压/监听队列/端口区/发送低水位/MTU 探测${ct_max:+（conntrack=${ct_max}）}，并已持久化。"
+    print_ok "已应用连接调优：背压/监听队列/端口区/发送低水位/MTU 探测${ct_max:+（conntrack=${ct_max}）}。"
+    if [ "${persisted}" = true ]; then print_ok "已持久化连接调优。"; else print_warn "连接调优未持久化；目录不可写/不存在或文件归属未确认。"; fi
   else
     print_warn "连接调优部分项写入失败（${err}），已跳过受限项。"
   fi
@@ -197,72 +235,30 @@ apply_sysctls_extra() {
 
 apply_network_tune() {
   net_tune_requested || return 0
-  [ "$(id -u 2>/dev/null || echo 1)" = "0" ] || return 0
+  [ "$(id -u 2>/dev/null || echo 1)" = 0 ] || return 0
   command_exists sysctl || return 0
-  # 冒烟测试环境不执行真实 sysctl/测速（免网络依赖与副作用）
-  if [ "${MM_TEST_MODE:-0}" = "1" ]; then
-    return 0
-  fi
-  local region bandwidth buffer_mb buffer_bytes cap_mb latency metric region_set
-  local explicit_region
-
-  # 地区档位：显式 net_tune_region 优先；否则首测时按延迟自动推断（v1.2.3）
-  explicit_region="$(manager_env_or_setting "net_tune_region" "")"
-  case "${explicit_region}" in
-  asia | overseas) region="${explicit_region}" ;;
-  *) region="" ;;
-  esac
-
-  buffer_mb="$(get_setting "net_tune_buffer_mb")"
-  bandwidth="$(get_setting "net_tune_bandwidth_mbps")"
-  if [ -n "${buffer_mb}" ] && [[ "${buffer_mb}" =~ ^[0-9]+$ ]]; then
-    : # 沿用已测速并持久化的 buffer
-  else
-    # 首次运行：优先显式带宽，否则自动测速（含延迟），再按档位换算 buffer 并持久化
-    bandwidth="${bandwidth:-}"
-    if [ -z "${bandwidth}" ]; then
-      bandwidth="$(env_var "net_tune_bandwidth_mbps")"
+  [ "${MM_TEST_MODE:-0}" != 1 ] || return 0
+  local region bandwidth buffer_mb buffer_bytes cap_mb
+  # Applying settings never performs a network probe or reads interactive input.
+  # probe_net_tune is a separate explicit operation performed outside the lock.
+  region="$(manager_env_or_setting net_tune_region '')" || return 1
+  case "${region}" in asia | overseas) ;; *) region=asia ;; esac
+  buffer_mb="$(get_setting net_tune_buffer_mb)" || return 1
+  if ! [[ "${buffer_mb}" =~ ^[1-9][0-9]{0,2}$ ]] || ((buffer_mb > 64)); then
+    bandwidth="$(manager_env_or_setting net_tune_bandwidth_mbps '')" || return 1
+    if ! [[ "${bandwidth}" =~ ^[0-9]{1,8}(\.[0-9]+)?$ ]]; then
+      bandwidth=1000
+      print_info 'net_tune：未提供测量值，采用 1000Mbps 默认档位；可显式测速或手动指定。'
     fi
-    latency=""
-    if [ -n "${bandwidth}" ] && [[ "${bandwidth}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-      : # 用户给定带宽，跳过测速
-    elif [ -z "${NET_TUNE_SKIP_SPEEDTEST:-}" ]; then
-      print_ok "net_tune：正在自动测速以智能优化 TCP 缓冲（首次运行，可 NET_TUNE_SKIP_SPEEDTEST=1 跳过）..."
-      if metric="$(measure_net_metrics)"; then
-        bandwidth="${metric%% *}"
-        latency="${metric#* }"
-        # 档位未显式设置时按延迟自动推断（延迟未知回退 asia）
-        if [ -z "${region}" ]; then
-          region="$(infer_net_tune_region "${latency}")"
-          region_set="yes"
-        fi
-        # 交互确认：网络不佳时测速/延迟误差大，允许人工覆写（仅交互式终端）
-        metric="$(net_tune_confirm_measurement "${bandwidth}" "${latency}" "${region}")"
-        bandwidth="${metric%% *}"
-        latency="${metric#* }"
-        # 覆写后若档位为自动推断值，则按最新延迟重推
-        if [ "${region_set:-}" = "yes" ]; then
-          region="$(infer_net_tune_region "${latency}")"
-        fi
-        print_ok "net_tune：测速结果 带宽约 ${COLOR_NUM_HL}${bandwidth}${COLOR_RESET} Mbit/s${latency:+、延迟约 ${COLOR_NUM_HL}${latency}${COLOR_RESET} ms}（${region} 档）。"
-      else
-        print_warn "自动测速不可用（缺少 speedtest 或网络受限），按带宽 1000Mbps 档位优化。"
-        bandwidth="1000"
-      fi
-    else
-      bandwidth="1000"
-    fi
-    [ -z "${region}" ] && region="asia"
-    cap_mb="$(get_tcp_buffer_cap_mb)"
-    buffer_mb="$(calculate_net_tune_buffer_mb "${bandwidth}" "${region}")"
-    set_setting "net_tune_bandwidth_mbps" "${bandwidth}"
-    set_setting "net_tune_latency_ms" "${latency:-}"
-    set_setting "net_tune_region" "${region}"
-    set_setting "net_tune_buffer_mb" "${buffer_mb}"
-    print_ok "net_tune：带宽约 ${COLOR_NUM_HL}${bandwidth}${COLOR_RESET} Mbps（${region} 档），内存上限 ${COLOR_NUM_HL}${cap_mb}${COLOR_RESET}MB，推荐 TCP 缓冲 ${COLOR_NUM_HL}${buffer_mb}${COLOR_RESET}MB。"
+    buffer_mb="$(calculate_net_tune_buffer_mb "${bandwidth}" "${region}")" || return 1
+    set_setting net_tune_bandwidth_mbps "${bandwidth}" || return 1
+    set_setting net_tune_region "${region}" || return 1
+    set_setting net_tune_buffer_mb "${buffer_mb}" || return 1
   fi
-
+  cap_mb="$(get_tcp_buffer_cap_mb)" || return 1
+  [[ "${buffer_mb}" =~ ^[1-9][0-9]{0,2}$ ]] && [[ "${cap_mb}" =~ ^[1-9][0-9]{0,2}$ ]] || return 1
+  ((buffer_mb <= cap_mb)) || buffer_mb="${cap_mb}"
   buffer_bytes=$((buffer_mb * 1024 * 1024))
-  apply_sysctls "${buffer_bytes}"
+  apply_sysctls "${buffer_bytes}" || return 1
   apply_sysctls_extra
 }

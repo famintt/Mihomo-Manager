@@ -9,7 +9,7 @@ umask 077
 _generate_self_signed() {
   local key_file="$1" cert_file="$2" domain="$3"
   local saf extfile alg
-  if [[ "$domain" =~ ^[0-9a-fA-F:.]+$ ]]; then
+  if is_ip_address "$domain"; then
     saf="subjectAltName=IP:${domain}"
   else
     saf="subjectAltName=DNS:${domain}"
@@ -57,54 +57,65 @@ _generate_self_signed() {
   return 1
 }
 
-ensure_tls_material() {
-  local tag="$1"
-  local domain="$2"
-  local cert_file="${CERT_DIR}/${tag}.crt"
-  local key_file="${CERT_DIR}/${tag}.key"
+# Validate a PEM certificate/private key pair noninteractively.
+_validate_certificate_bundle() {
+  local cert_file="$1" key_file="$2" cert_pub key_pub
+  openssl x509 -in "$cert_file" -noout >/dev/null 2>&1 || return 1
+  openssl pkey -in "$key_file" -passin pass: -noout >/dev/null 2>&1 || return 1
+  cert_pub="$(openssl x509 -in "$cert_file" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 -r 2>/dev/null | awk '{print $1}')" || return 1
+  key_pub="$(openssl pkey -in "$key_file" -passin pass: -pubout -outform DER 2>/dev/null | openssl dgst -sha256 -r 2>/dev/null | awk '{print $1}')" || return 1
+  [ -n "$cert_pub" ] && [ "$cert_pub" = "$key_pub" ] || return 1
+  openssl verify -trusted "$cert_file" -partial_chain "$cert_file" >/dev/null 2>&1
+}
 
-  if [ -f "$cert_file" ] && [ -f "$key_file" ]; then
-    chmod 600 "$cert_file" "$key_file"
-    printf '%s|%s' "$cert_file" "$key_file"
-    return 0
+_publish_certificate_bundle() {
+  local tag="$1" cert_source="$2" key_source="$3" cert_file key_file stage had_cert=false had_key=false
+  [[ "$tag" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+  cert_file="${CERT_DIR}/${tag}.custom.crt"; key_file="${CERT_DIR}/${tag}.custom.key"
+  stage="$(mktemp -d "${CERT_DIR}/.cert-import.XXXXXX")" || return 1
+  if ! cp -- "$cert_source" "${stage}/candidate.crt" || ! cp -- "$key_source" "${stage}/candidate.key" || ! _validate_certificate_bundle "${stage}/candidate.crt" "${stage}/candidate.key"; then rm -rf -- "$stage"; return 1; fi
+  chmod 600 "${stage}/candidate.crt" "${stage}/candidate.key" || { rm -rf -- "$stage"; return 1; }
+  if [ -e "$cert_file" ] || [ -L "$cert_file" ]; then mv -- "$cert_file" "${stage}/previous.crt" || { rm -rf -- "$stage"; return 1; }; had_cert=true; fi
+  if [ -e "$key_file" ] || [ -L "$key_file" ]; then
+    if ! mv -- "$key_file" "${stage}/previous.key"; then [ "$had_cert" = false ] || mv -- "${stage}/previous.crt" "$cert_file"; rm -rf -- "$stage"; return 1; fi
+    had_key=true
   fi
-
-  # 自签证书有效期 99 年（99×365=36135 天），配合证书指纹固定（pcs），
-  # 避免客户端的证书过期告警与频繁重建。
-  if ! _generate_self_signed "$key_file" "$cert_file" "$domain"; then
-    rm -f "${cert_file}" "${key_file}"
-    print_err "自签证书生成失败（含 SAN）：${domain}"
-    return 1
+  if ! mv -- "${stage}/candidate.crt" "$cert_file" || ! mv -- "${stage}/candidate.key" "$key_file"; then
+    rm -f -- "$cert_file" "$key_file"
+    [ "$had_cert" = false ] || mv -- "${stage}/previous.crt" "$cert_file"
+    [ "$had_key" = false ] || mv -- "${stage}/previous.key" "$key_file"
+    rm -rf -- "$stage"; return 1
   fi
-
-  chmod 600 "$cert_file" "$key_file"
+  if declare -F service_certificate_permissions >/dev/null; then
+    if ! service_certificate_permissions "$cert_file" "$key_file"; then rm -f -- "$cert_file" "$key_file"; [ "$had_cert" = false ] || mv -- "${stage}/previous.crt" "$cert_file"; [ "$had_key" = false ] || mv -- "${stage}/previous.key" "$key_file"; rm -rf -- "$stage"; return 1; fi
+  elif ! chmod 600 "$cert_file" "$key_file"; then rm -f -- "$cert_file" "$key_file"; [ "$had_cert" = false ] || mv -- "${stage}/previous.crt" "$cert_file"; [ "$had_key" = false ] || mv -- "${stage}/previous.key" "$key_file"; rm -rf -- "$stage"; return 1
+  fi
+  rm -rf -- "$stage"
   printf '%s|%s' "$cert_file" "$key_file"
 }
 
-# 判断给定证书是否覆盖目标主机名：subject CN 或 SAN（DNS/IP）精确匹配，
-# 支持 DNS 通配证书（DNS:*.example.com 匹配 foo.example.com）。
-# 用于分享链接跳过校验判定：证书主体不覆盖链接 SNI 时（如自定义证书 +
-# 伪装 SNI），客户端对证书的常规校验必然失败，必须追加 insecure/pinSHA256。
+ensure_tls_material() {
+  local tag="$1" domain="$2" cert_file key_file
+  [[ "$tag" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+  cert_file="${CERT_DIR}/${tag}.crt"; key_file="${CERT_DIR}/${tag}.key"
+  if [ ! -f "$cert_file" ] || [ ! -f "$key_file" ]; then _generate_self_signed "$key_file" "$cert_file" "$domain" || { rm -f -- "$cert_file" "$key_file"; print_err "自签证书生成失败（含 SAN）：${domain}"; return 1; }; fi
+  _validate_certificate_bundle "$cert_file" "$key_file" || { print_err "证书或私钥无效：${tag}"; return 1; }
+  if declare -F service_certificate_permissions >/dev/null; then service_certificate_permissions "$cert_file" "$key_file" || return 1; else chmod 600 "$cert_file" "$key_file" || return 1; fi
+  printf '%s|%s' "$cert_file" "$key_file"
+}
+
 cert_covers_host() {
-  local cert_file="$1" host="$2"
-  [ -f "${cert_file}" ] || return 1
-  [ -n "${host}" ] || return 1
-  local cn san entry base
-  cn="$(openssl x509 -in "${cert_file}" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *\([^,]\{1,\}\).*/\1/p' || true)"
-  [ -n "${cn}" ] && [ "${cn}" = "${host}" ] && return 0
-  san="$(openssl x509 -in "${cert_file}" -noout -ext subjectAltName 2>/dev/null | grep -oE '(DNS|IP Address):[^, ]+' || true)"
-  while IFS= read -r entry; do
-    [ -n "${entry}" ] || continue
-    entry="${entry#*:}"
-    [ "${entry}" = "${host}" ] && return 0
-    case "${entry}" in
-    "*."*)
-      base="${entry#\*.}"
-      [ -n "${base}" ] && [ "${host}" != "${base}" ] && [[ "${host}" == *".${base}" ]] && return 0
-      ;;
-    esac
-  done <<<"${san}"
-  return 1
+  local cert_file="$1" host="$2" result
+  [ -f "$cert_file" ] && [ -n "$host" ] || return 1
+  openssl x509 -in "$cert_file" -noout >/dev/null 2>&1 || return 1
+  # OpenSSL 1.1.1 may return zero for a mismatch; require its positive result too.
+  if is_ip_address "$host"; then
+    result="$(LC_ALL=C openssl x509 -in "$cert_file" -noout -checkip "$host" 2>/dev/null)" || return 1
+    [ "$result" = "IP $host does match certificate" ]
+  else
+    result="$(LC_ALL=C openssl x509 -in "$cert_file" -noout -checkhost "$host" 2>/dev/null)" || return 1
+    [ "$result" = "Hostname $host does match certificate" ]
+  fi
 }
 
 # 分享链接是否需要跳过证书校验（追加 insecure/pinSHA256/allowInsecure）：
@@ -152,46 +163,20 @@ managed_cert_path() {
 }
 
 import_custom_certificate_bundle() {
-  local tag="$1"
-  local cert_path="$2"
-  local key_path="$3"
-  local cert_file="${CERT_DIR}/${tag}.custom.crt"
-  local key_file="${CERT_DIR}/${tag}.custom.key"
-  local cert_copied=false
-
-  if [ "$cert_path" != "$cert_file" ]; then
-    cp "$cert_path" "$cert_file" || return 1
-    cert_copied=true
-  fi
-  if [ "$key_path" != "$key_file" ]; then
-    cp "$key_path" "$key_file" || {
-      if [ "$cert_copied" = true ]; then
-        rm -f "$cert_file"
-      fi
-      return 1
-    }
-  fi
-  chmod 600 "$cert_file" "$key_file"
-  printf '%s|%s' "$cert_file" "$key_file"
+  local tag="$1" cert_path="$2" key_path="$3"
+  _publish_certificate_bundle "$tag" "$cert_path" "$key_path"
 }
 
 import_custom_certificate_content() {
-  local tag="$1"
-  local cert_b64="$2"
-  local key_b64="$3"
-  local cert_file="${CERT_DIR}/${tag}.custom.crt"
-  local key_file="${CERT_DIR}/${tag}.custom.key"
-
-  if [ -z "$cert_b64" ] || [ -z "$key_b64" ]; then
-    return 1
+  local tag="$1" cert_b64="$2" key_b64="$3" stage pair
+  [ -n "$cert_b64" ] && [ -n "$key_b64" ] || return 1
+  stage="$(mktemp -d "${CERT_DIR}/.cert-content.XXXXXX")" || return 1
+  if ! printf '%s' "$cert_b64" | base64 -d >"${stage}/candidate.crt" || ! printf '%s' "$key_b64" | base64 -d >"${stage}/candidate.key"; then
+    rm -rf -- "$stage"; return 1
   fi
-  printf '%s' "$cert_b64" | base64 -d >"$cert_file" || return 1
-  printf '%s' "$key_b64" | base64 -d >"$key_file" || {
-    rm -f "$cert_file"
-    return 1
-  }
-  chmod 600 "$cert_file" "$key_file"
-  printf '%s|%s' "$cert_file" "$key_file"
+  pair="$(_publish_certificate_bundle "$tag" "${stage}/candidate.crt" "${stage}/candidate.key")" || { rm -rf -- "$stage"; return 1; }
+  rm -rf -- "$stage"
+  printf '%s' "$pair"
 }
 
 remove_node_certificates() {
@@ -200,10 +185,10 @@ remove_node_certificates() {
   local key_file="${3:-}"
 
   if [ -n "$cert_file" ] && [ -f "$cert_file" ] && managed_cert_path "$tag" "$cert_file"; then
-    rm -f "$cert_file"
+    rm -f "$cert_file" || return 1
   fi
   if [ -n "$key_file" ] && [ -f "$key_file" ] && managed_cert_path "$tag" "$key_file"; then
-    rm -f "$key_file"
+    rm -f "$key_file" || return 1
   fi
 }
 
@@ -217,6 +202,8 @@ migrate_custom_certificate_bundle() {
   cert_file="$(node_value "$tag" "certificate_path")"
   key_file="$(node_value "$tag" "key_path")"
   if managed_cert_path "$tag" "$cert_file" && managed_cert_path "$tag" "$key_file"; then
+    _validate_certificate_bundle "$cert_file" "$key_file" || { print_err "托管的自定义证书或私钥无效：${tag}"; return 1; }
+    if declare -F service_certificate_permissions >/dev/null; then service_certificate_permissions "$cert_file" "$key_file" || return 1; fi
     return 0
   fi
   if [ ! -r "$cert_file" ] || [ ! -r "$key_file" ]; then
@@ -250,7 +237,7 @@ prompt_certificate_bundle() {
     mode="$(prompt_choice "证书模式 (self-signed/custom)" "self-signed")"
     case "$mode" in
     self-signed | self | quick)
-      pair="$(ensure_tls_material "$tag" "$default_domain")"
+      pair="$(ensure_tls_material "$tag" "$default_domain")" || return 1
       printf 'self-signed|%s|%s' "${pair%|*}" "${pair#*|}"
       return 0
       ;;
@@ -280,16 +267,20 @@ prompt_certificate_bundle() {
 }
 
 cleanup_orphan_certs() {
-  local f path tag
-  # 约定（L8 钉住）：证书文件名一律为 <tag>.crt / <tag>.key / <tag>.custom.crt / <tag>.custom.key，
-  # tag 即首点前段（generate_tag 产物为 <前缀>-<时间戳>-<hex>，不含点——若未来 tag 允许含点必须先改此处）。
-  # 防御性校验 tag 字符集（仅允许 [A-Za-z0-9_-]），异常命名一律跳过，绝不误删。
-  while IFS= read -r f; do
-    path="${f##*/}"
-    tag="${path%%.*}"
-    [[ "${tag}" =~ ^[A-Za-z0-9_-]+$ ]] || continue
-    if ! jq -e --arg tag "${tag}" 'has($tag)' "${NODES_FILE}" >/dev/null 2>&1; then
-      rm -f "${f}"
-    fi
-  done < <(find "${CERT_DIR}" -type f \( -name '*.crt' -o -name '*.key' \) 2>/dev/null)
+  local file tag rc list_file
+  local -a cert_files=()
+  [ -r "$NODES_FILE" ] && [ -r "$CERT_DIR" ] || return 1
+  jq -e 'type == "object" and all(.[]; type == "object")' "$NODES_FILE" >/dev/null 2>&1 || return 1
+  list_file="$(mktemp "${CERT_DIR}/.cert-list.XXXXXX")" || return 1
+  if ! find "$CERT_DIR" -maxdepth 1 -type f \( -name "*.crt" -o -name "*.key" \) -print0 >"$list_file"; then rm -f -- "$list_file"; return 1; fi
+  while IFS= read -r -d '' file; do cert_files+=("$file"); done <"$list_file"
+  rm -f -- "$list_file" || return 1
+  for file in "${cert_files[@]}"; do
+    tag="${file##*/}"; tag="${tag%%.*}"
+    [[ "$tag" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+    case "${file##*/}" in "$tag.crt"|"$tag.key"|"$tag.custom.crt"|"$tag.custom.key") ;; *) continue ;; esac
+    if jq -e --arg tag "$tag" 'has($tag)' "$NODES_FILE" >/dev/null 2>&1; then continue; else rc=$?; fi
+    [ "$rc" -eq 1 ] || return 1
+    rm -f -- "$file" || return 1
+  done
 }

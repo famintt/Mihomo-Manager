@@ -36,48 +36,84 @@ warn_if_bindv6only() {
   fi
 }
 
-is_ip_address() {
+_is_ipv4_address() {
   local ip="$1" octet
-  # IPv4：四组 0-255（兼容前导零）
-  if [[ "${ip}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
-    for octet in "${BASH_REMATCH[@]:1:4}"; do
-      [ "$((10#${octet}))" -le 255 ] || return 1
-    done
-    return 0
-  fi
-  # IPv6：仅含 hex 与冒号，且 :: 至多出现一次
-  if [[ "${ip}" == *:* ]] && [[ "${ip}" =~ ^[0-9a-fA-F:]+$ ]]; then
-    case "${ip}" in
-    *::*::*) return 1 ;;
-    *) return 0 ;;
-    esac
-  fi
-  return 1
+  local -a octets=()
+  [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS=. read -r -a octets <<<"${ip}"
+  for octet in "${octets[@]}"; do
+    # 前导零在不同解析器中有十进制/八进制歧义，统一拒绝。
+    [[ "${octet}" = 0 || "${octet}" != 0* ]] || return 1
+    [ "$((10#${octet}))" -le 255 ] || return 1
+  done
 }
 
+_ipv6_groups() {
+  local ip="$1" tail left right missing group
+  local -a octets=() left_groups=() right_groups=() groups=()
+  # 展开为八个十进制 hextet；不调用 DNS，也不依赖 ip/python。
+  if [[ "${ip}" == *.* ]]; then
+    tail="${ip##*:}"
+    _is_ipv4_address "${tail}" || return 1
+    IFS=. read -r -a octets <<<"${tail}"
+    printf -v tail '%x:%x' "$((octets[0] * 256 + octets[1]))" "$((octets[2] * 256 + octets[3]))"
+    ip="${ip%"${ip##*:}"}${tail}"
+  fi
+  if [[ "${ip}" == *::* ]]; then
+    left="${ip%%::*}"; right="${ip#*::}"
+    [[ "${left}" != *: && "${right}" != :* && "${right}" != *::* ]] || return 1
+    [ -z "${left}" ] || IFS=: read -r -a left_groups <<<"${left}"
+    [ -z "${right}" ] || IFS=: read -r -a right_groups <<<"${right}"
+    missing=$((8 - ${#left_groups[@]} - ${#right_groups[@]}))
+    [ "${missing}" -gt 0 ] || return 1
+    groups=("${left_groups[@]}")
+    while [ "${missing}" -gt 0 ]; do groups+=(0); missing=$((missing - 1)); done
+    groups+=("${right_groups[@]}")
+  else
+    [[ "${ip}" != :* && "${ip}" != *: ]] || return 1
+    IFS=: read -r -a groups <<<"${ip}"
+    [ "${#groups[@]}" -eq 8 ] || return 1
+  fi
+  for group in "${groups[@]}"; do
+    [[ "${group}" =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+  done
+  for group in "${groups[@]}"; do printf '%s ' "$((16#${group}))"; done
+}
+is_ip_address() {
+  if [[ "$1" == *:* ]]; then
+    _ipv6_groups "$1" >/dev/null
+  else
+    _is_ipv4_address "$1"
+  fi
+}
+
+# 历史函数名：0 表示私网、特殊用途或无效地址，均不能作为探测得到的公网 IP。
 is_private_ip() {
-  local ip="$1"
-  local lower
-  lower="${ip,,}"
-
-  if [[ "${ip}" =~ ^10\. ]] || [[ "${ip}" =~ ^127\. ]] || [[ "${ip}" =~ ^169\.254\. ]] || [[ "${ip}" =~ ^192\.168\. ]]; then
+  local ip="$1" expanded a b c
+  local -a parts=()
+  is_ip_address "${ip}" || return 0
+  if [[ "${ip}" != *:* ]]; then
+    IFS=. read -r a b c _ <<<"${ip}"
+    if (( a == 0 || a == 10 || a == 127 || a >= 224 ||
+      (a == 100 && b >= 64 && b <= 127) || (a == 169 && b == 254) ||
+      (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) ||
+      (a == 192 && b == 0 && (c == 0 || c == 2)) ||
+      (a == 192 && b == 88 && c == 99) || (a == 198 && (b == 18 || b == 19)) ||
+      (a == 198 && b == 51 && c == 100) || (a == 203 && b == 0 && c == 113) )); then
+      return 0
+    fi
+    return 1
+  fi
+  expanded="$(_ipv6_groups "${ip}")" || return 0
+  read -r -a parts <<<"${expanded}"
+  a="${parts[0]}"; b="${parts[1]}"; c="${parts[2]}"
+  # 仅接收全球单播 2000::/3；同时排除文档、基准测试、ORCHID、6to4 等特殊段。
+  # 这也覆盖压缩/展开的 ::/::1、IPv4 映射、ULA、链路/站点本地、组播和 NAT64。
+  if (( a < 0x2000 || a > 0x3fff || a == 0x2002 ||
+    (a == 0x2001 && (b < 0x0200 || b == 0x0db8)) ||
+    (a == 0x3fff && b <= 0x0fff) )); then
     return 0
   fi
-  if [[ "${ip}" =~ ^172\.([1][6-9]|2[0-9]|3[0-1])\. ]] || [[ "${ip}" =~ ^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\. ]]; then
-    return 0
-  fi
-  # L4：补充协议保留/特殊用途段（RFC 6890）：0/8、198.18/15、IETF 协议保留 192.0.0.0/24、
-  # TEST-NET 192.0.2/24、198.51.100/24、203.0.113/24、组播 224/4、保留 240/4（含广播）
-  if [[ "${ip}" =~ ^0\. ]] || [[ "${ip}" =~ ^198\.(18|19)\. ]] || [[ "${ip}" =~ ^192\.0\.(0|2)\. ]] \
-    || [[ "${ip}" =~ ^198\.51\.100\. ]] || [[ "${ip}" =~ ^203\.0\.113\. ]] \
-    || [[ "${ip}" =~ ^2(2[4-9]|3[0-9])\. ]] || [[ "${ip}" =~ ^2(4[0-9]|5[0-5])\. ]]; then
-    return 0
-  fi
-
-  case "${lower}" in
-  "" | "::" | "::1" | fe80:* | fc*:* | fd*:* | 2001:db8:* | 2002:* | 64:ff9b:* | ff*:* | ::ffff:*) return 0 ;;
-  esac
-
   return 1
 }
 

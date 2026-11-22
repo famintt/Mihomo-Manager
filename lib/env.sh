@@ -17,7 +17,13 @@ SETTING_FILE="${SETTING_FILE:-${BASE_DIR}/settings.json}"
 CERT_DIR="${CERT_DIR:-${BASE_DIR}/certs}"
 LOG_DIR="${LOG_DIR:-${BASE_DIR}/logs}"
 RUNTIME_DIR="${RUNTIME_DIR:-${BASE_DIR}/runtime}"
-LOCK_FILE="${LOCK_FILE:-${BASE_DIR}/.lock}"
+LOCK_ROOT="${LOCK_ROOT:-/run/lock/mihomo-manager}"
+# Keep the inode outside BASE_DIR: uninstall must retain the same lock until exit.
+if [ -z "${LOCK_FILE:-}" ]; then
+  _lock_key="$(printf '%s' "${BASE_DIR}" | cksum)"
+  LOCK_FILE="${LOCK_ROOT}/${_lock_key%% *}.lock"
+  unset _lock_key
+fi
 LOCK_TIMEOUT="${LOCK_TIMEOUT:-30}"
 LOG_ROTATE_SIZE_MB="${LOG_ROTATE_SIZE_MB:-50}"
 LOG_ROTATE_BACKUPS="${LOG_ROTATE_BACKUPS:-3}"
@@ -34,8 +40,12 @@ COLOR_BLUE="\033[1;34m"
 COLOR_RESET="\033[0m"
 COLOR_NUM_HL="\033[1;92m"
 
-LOCK_HELD=false
-LOCK_FD=""
+# Reloading modules during an upgrade must retain the same open lock and owner.
+LOCK_HELD="${LOCK_HELD:-false}"
+LOCK_FD="${LOCK_FD:-}"
+LOCK_OWNER_PID="${LOCK_OWNER_PID:-}"
+_AUTO_ROLLBACK_DIR="${_AUTO_ROLLBACK_DIR:-}"
+_AUTO_ROLLBACK_OWNER="${_AUTO_ROLLBACK_OWNER:-}"
 LOCK_DIR_FALLBACK="${LOCK_FILE}.d"
 PUBLIC_IP_CACHE="${PUBLIC_IP_CACHE:-}"
 HAS_PUBLIC_IPV4=""
@@ -63,13 +73,13 @@ mm_module_path() {
 mm_load_all() {
   local m f
   for m in "${MM_MODULES[@]}"; do
-    f="$(mm_module_path "$m")"
+    f="$(mm_module_path "$m")" || return 1
     if [ -z "${f}" ]; then
       echo "未找到 lib/${m}.sh。" >&2
       return 1
     fi
     # shellcheck source=/dev/null
-    . "${f}"
+    . "${f}" || return 1
   done
 }
 
@@ -120,27 +130,67 @@ require_root() {
 }
 
 setup_common_traps() {
-  trap 'release_lock' EXIT
-  trap 'release_lock; exit 130' INT
-  trap 'release_lock; exit 143' TERM
+  trap 'handle_common_exit "$?"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   trap 'handle_common_error "${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}" "${BASH_LINENO[0]:-0}" "$?"' ERR
 }
 
-handle_common_error() {
-  local source_file="$1"
-  local line_no="$2"
-  local exit_code="$3"
-  print_err "命令执行失败：${source_file}:${line_no}"
-  # 事务回滚（auto_install 的 rep 窗口）：已清空旧节点但尚未提交时，
-  # 失败必须恢复备份，避免停留"旧节点消失、新配置未启动"的不一致状态（F-02）
-  if [ -n "${_AUTO_ROLLBACK_DIR:-}" ] && [ -d "${_AUTO_ROLLBACK_DIR}" ]; then
-    print_err "检测到未提交的 rep 事务，正在自动恢复到安装前状态..."
-    _AUTO_ROLLBACK_DIR=""
-    restore_latest_backup || true
-    reconcile_state || true
-    render_config || true
-    start_service || true
+rollback_pending_transaction() {
+  local snapshot="${_AUTO_ROLLBACK_DIR:-}"
+  [ -n "$snapshot" ] || return 0
+  [ "${_AUTO_ROLLBACK_OWNER:-}" = "${BASHPID}" ] || return 0
+  _AUTO_ROLLBACK_DIR=""
+  _AUTO_ROLLBACK_OWNER=""
+  print_warn "事务尚未提交，正在恢复指定快照：$snapshot"
+  if declare -F stop_all_argo_nodes >/dev/null 2>&1; then
+    if ! stop_all_argo_nodes; then
+      print_err "无法停止待回退的 Argo，保留快照：$snapshot"
+      return 1
+    fi
   fi
-  release_lock
-  exit "${exit_code}"
+  if ! stop_service; then
+    print_err "无法停止待回退的服务，保留快照：$snapshot"
+    return 1
+  fi
+  if [ -f "$snapshot/.raw-state-v1" ] && [ ! -L "$snapshot/.raw-state-v1" ]; then
+    if ! restore_raw_state "$snapshot"; then
+      print_err "原始状态恢复失败，服务保持停止，保留隔离快照：$snapshot"
+      return 1
+    fi
+    if [ ! -f "$snapshot/.restart-safe" ] || [ -L "$snapshot/.restart-safe" ]; then
+      print_warn "操作前状态不完整或无效；已恢复原始字节，服务与 Argo 保持停止。"
+      return 0
+    fi
+  elif ! restore_state_backup "$snapshot"; then
+    print_err "状态恢复失败，保留快照以便人工恢复：$snapshot"
+    return 1
+  fi
+  # Restore the known config bytes, not a fresh render of possibly partial state.
+  if ! start_service; then
+    print_err "状态已恢复，但原服务未能启动。"
+    return 1
+  fi
+  if declare -F restart_all_argo_nodes >/dev/null 2>&1; then
+    restart_all_argo_nodes || { print_err "状态已恢复，但原 Argo 隧道未能全部启动。"; return 1; }
+  fi
+}
+
+handle_common_exit() {
+  local exit_code="$1"
+  trap - EXIT ERR
+  if ! rollback_pending_transaction; then
+    exit_code=1
+  fi
+  if declare -F release_lock >/dev/null 2>&1; then
+    release_lock
+  fi
+  exit "$exit_code"
+}
+
+handle_common_error() {
+  local source_file="$1" line_no="$2" exit_code="$3"
+  print_err "命令执行失败：${source_file}:${line_no}"
+  # EXIT owns rollback/release; ERR may run in inherited subshells.
+  exit "$exit_code"
 }

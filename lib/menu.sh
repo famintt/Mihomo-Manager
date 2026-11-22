@@ -95,14 +95,14 @@ net_tune_apply_manual() {
   local bandwidth="$1" latency="$2" region buffer_mb buffer_bytes
   region="$(infer_net_tune_region "${latency}")"
   buffer_mb="$(calculate_net_tune_buffer_mb "${bandwidth}" "${region}")"
-  set_setting "net_tune_bandwidth_mbps" "${bandwidth}"
-  set_setting "net_tune_latency_ms" "${latency}"
-  set_setting "net_tune_region" "${region}"
-  set_setting "net_tune_buffer_mb" "${buffer_mb}"
+  set_setting "net_tune_bandwidth_mbps" "${bandwidth}" || return $?
+  set_setting "net_tune_latency_ms" "${latency}" || return $?
+  set_setting "net_tune_region" "${region}" || return $?
+  set_setting "net_tune_buffer_mb" "${buffer_mb}" || return $?
   buffer_bytes=$((buffer_mb * 1024 * 1024))
   if [ "$(id -u 2>/dev/null || echo 1)" = "0" ] && command_exists sysctl; then
-    apply_sysctls "${buffer_bytes}"
-    apply_sysctls_extra
+    apply_sysctls "${buffer_bytes}" || return $?
+    apply_sysctls_extra || return $?
   fi
   print_ok "已应用：带宽 ${COLOR_NUM_HL}${bandwidth}${COLOR_RESET} Mbps，延迟 ${COLOR_NUM_HL}${latency}${COLOR_RESET} ms（${region} 档）→ TCP 缓冲 ${COLOR_NUM_HL}${buffer_mb}${COLOR_RESET}MB。"
 }
@@ -123,11 +123,30 @@ net_tune_menu() {
     read -r -p "请选择: " choice || return 0
     case "${choice}" in
     1)
-      # 清空已持久化结果强制重新测速+确认（apply_network_tune 见持久化值则跳过）
-      set_setting "net_tune_buffer_mb" ""
-      set_setting "net_tune_bandwidth_mbps" ""
-      set_setting "net_tune_latency_ms" ""
-      apply_network_tune
+      # Probe before taking the lock; persist/apply the confirmed result under a short lock.
+      local metric measured_bw measured_rtt confirmed
+      if ! metric="$(probe_net_tune)"; then
+        print_warn "测速未运行或失败；现有设置保持不变。"
+        pause_menu
+        continue
+      fi
+      measured_bw="${metric%% *}"; measured_rtt="${metric#* }"
+      if ! confirmed="$(net_tune_confirm_measurement "${measured_bw}" "${measured_rtt}" "$(infer_net_tune_region "${measured_rtt}")")"; then
+        print_warn "测速结果未确认；现有设置保持不变。"
+        pause_menu
+        continue
+      fi
+      measured_bw="${confirmed%% *}"; measured_rtt="${confirmed#* }"
+      acquire_lock || { print_err "无法取得配置锁。"; pause_menu; continue; }
+      if net_tune_apply_manual "${measured_bw}" "${measured_rtt}"; then
+        release_lock
+      else
+        local rc=$?
+        release_lock || true
+        print_err "网络调优设置未能应用。"
+        pause_menu
+        return "$rc"
+      fi
       pause_menu
       ;;
     2)
@@ -138,7 +157,16 @@ net_tune_menu() {
         print_warn "延迟无效（${rtt:-空}），回退按 asia 档。"
         rtt=""
       fi
-      net_tune_apply_manual "${bw}" "${rtt}"
+      acquire_lock || { print_err "无法取得配置锁。"; pause_menu; continue; }
+      if net_tune_apply_manual "${bw}" "${rtt}"; then
+        release_lock
+      else
+        local rc=$?
+        release_lock || true
+        print_err "网络调优设置未能应用。"
+        pause_menu
+        return "$rc"
+      fi
       pause_menu
       ;;
     3)
@@ -240,7 +268,7 @@ print_cli_usage() {
   rep        覆盖式一键安装：备份后清空已有节点，按环境变量重建并启动
   ins        追加式一键安装：备份后保留已有节点，按环境变量追加节点并启动
   list       查看节点与分享链接
-  add         按参数添加单个节点（sbm add --help）
+  add         按参数添加单个节点（mm add --help）
   sni         检测并推荐 Reality SNI
   status      查看服务/节点状态
   doctor      配置与服务健康检查

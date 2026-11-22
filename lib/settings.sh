@@ -7,7 +7,12 @@ get_setting() {
   local key="$1"
   local default="${2:-}"
   local value
-  value="$(jq -r --arg key "$key" '.[$key] // empty' "${SETTING_FILE}" 2>/dev/null | tr -d '\r')"
+  if [ ! -e "${SETTING_FILE}" ]; then
+    printf '%s' "$default"
+    return 0
+  fi
+  validate_json_object "${SETTING_FILE}" || { print_err "设置文件损坏：${SETTING_FILE}"; return 1; }
+  value="$(jq -r --arg key "$key" '.[$key] // empty' "${SETTING_FILE}")" || return 1
   printf '%s' "${value:-${default}}"
 }
 
@@ -29,13 +34,13 @@ manager_env_or_setting() {
     printf '%s' "${_v}"
     return 0
   fi
-  printf '%s' "$(get_setting "$_key" "$_default")"
+  get_setting "$_key" "$_default"
 }
 
 set_setting() {
   local key="$1"
   local value="$2"
-  init_storage
+  init_storage || return 1
   # shellcheck disable=SC2016
   json_update "${SETTING_FILE}" --arg key "$key" --arg value "$value" '.[$key] = $value'
 }

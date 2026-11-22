@@ -5,6 +5,253 @@ set -eEuo pipefail
 
 umask 077
 
+MIHOMO_SERVICE_USER="${MIHOMO_SERVICE_USER:-mihomo}"
+MIHOMO_SERVICE_GROUP="${MIHOMO_SERVICE_GROUP:-mihomo}"
+MIHOMO_DATA_DIR="${MIHOMO_DATA_DIR:-${BASE_DIR}/data}"
+MM_CLI="${MM_CLI:-${INSTALL_BIN:-/usr/local/bin/mm}}"
+
+mihomo_data_dir() {
+  local dir="${MIHOMO_DATA_DIR}" base="${BASE_DIR%/}" current="" part
+  [[ "${base}" = /* ]] || { print_err "BASE_DIR 必须为绝对路径。"; return 1; }
+  case "${base}${dir}" in
+    *:* | *[[:space:]]* | *$'\n'* | *$'\r'* | *'\\'*) print_err "mihomo 数据路径含不安全字符。"; return 1 ;;
+  esac
+  [ "${dir}" = "${base}/data" ] || { print_err "mihomo 数据目录只能是 BASE_DIR/data。"; return 1; }
+  local -a parts=()
+  IFS='/' read -r -a parts <<< "${dir#/}"
+  for part in "${parts[@]}"; do
+    [ -n "${part}" ] || continue
+    [ "${part}" != . ] && [ "${part}" != .. ] || return 1
+    current="${current}/${part}"
+    [ ! -L "${current}" ] || { print_err "拒绝符号链接路径组件：${current}"; return 1; }
+  done
+  printf '%s' "${dir}"
+}
+
+mihomo_safe_paths() {
+  local base cert data
+  case "${BASE_DIR}${CERT_DIR}" in
+    *:* | *[[:space:]]* | *$'\n'* | *$'\r'* | *'\\'*) print_err "SAFE_PATHS 路径含不安全字符。"; return 1 ;;
+  esac
+  [ -d "${BASE_DIR}" ] && [ ! -L "${BASE_DIR}" ] || return 1
+  [ -d "${CERT_DIR}" ] && [ ! -L "${CERT_DIR}" ] || return 1
+  data="$(mihomo_data_dir)" || return 1
+  [ -d "${data}" ] && [ ! -L "${data}" ] || { print_err "mihomo 数据目录不存在或是符号链接。"; return 1; }
+  base="$(cd -P -- "${BASE_DIR}" && pwd)" || return 1
+  cert="$(cd -P -- "${CERT_DIR}" && pwd)" || return 1
+  data="$(cd -P -- "${data}" && pwd)" || return 1
+  [ "${base}" = "${BASE_DIR%/}" ] && [ "${cert}" = "${CERT_DIR%/}" ] && [ "${data}" = "${MIHOMO_DATA_DIR%/}" ] || { print_err "SAFE_PATHS 路径不能经过符号链接。"; return 1; }
+  printf '%s:%s' "${base}" "${cert}"
+}
+
+service_config_permissions() {
+  local config="${1:-${CONFIG_FILE}}" base_real config_real
+  [ -f "${config}" ] && [ ! -L "${config}" ] || { print_err "配置文件不存在或是符号链接：${config}"; return 1; }
+  case "${BASE_DIR}${config}" in *:* | *[[:space:]]* | *$'\n'* | *$'\r'* | *'\\'*) print_err "配置路径含不安全字符。"; return 1 ;; esac
+  base_real="$(cd -P -- "${BASE_DIR}" && pwd)" || return 1
+  config_real="$(cd -P -- "$(dirname -- "${config}")" && pwd)/$(basename -- "${config}")" || return 1
+  case "${config_real}" in "${base_real}"/*) ;; *) print_err "配置文件必须位于 BASE_DIR 内。"; return 1 ;; esac
+  [ "${MM_TEST_MODE:-0}" = 1 ] && return 0
+  service_ensure_identity || return 1
+  chown root:"${MIHOMO_SERVICE_GROUP}" "${config}" || return 1
+  chmod 0640 "${config}"
+}
+
+mihomo_validate() {
+  local config="${1:-${CONFIG_FILE}}" safe data
+  service_data_permissions || return 1
+  service_config_permissions "${config}" || return 1
+  safe="$(mihomo_safe_paths)" || return 1
+  data="$(mihomo_data_dir)" || return 1
+  if [ "${MM_TEST_MODE:-0}" = 1 ]; then
+    SAFE_PATHS="${safe}" "${MIHOMO_BIN}" -d "${data}" -t -f "${config}"
+  else
+    service_run_as_user "${safe}" "${MIHOMO_BIN}" -d "${data}" -t -f "${config}"
+  fi
+}
+
+mihomo_run() {
+  local config="${1:-${CONFIG_FILE}}" safe data
+  service_data_permissions || return 1
+  service_config_permissions "${config}" || return 1
+  safe="$(mihomo_safe_paths)" || return 1
+  data="$(mihomo_data_dir)" || return 1
+  mihomo_exec_as_user "${safe}" "${MIHOMO_BIN}" -d "${data}" -f "${config}"
+}
+
+# 以服务用户执行所需的降权工具：BusyBox 的 setpriv 只管理能力位、不支持 uid/gid
+# 切换（Alpine 精简镜像常见），所以必须先做功能探测再选择，不能只看命令是否存在。
+service_shell_quote() {
+  local out='' arg
+  for arg in "$@"; do
+    out+="'${arg//\'/\'\\\'\'}' "
+  done
+  printf '%s' "${out% }"
+}
+
+service_priv_drop_kind() {
+  if command_exists setpriv && setpriv --reuid=0 --regid=0 --clear-groups -- true >/dev/null 2>&1; then
+    printf 'setpriv'
+    return 0
+  fi
+  if command_exists su-exec; then
+    printf 'su-exec'
+    return 0
+  fi
+  if command_exists su; then
+    printf 'su'
+    return 0
+  fi
+  return 1
+}
+
+service_run_as_user() {
+  local safe="$1" kind uid gid
+  shift
+  if [ "${MM_TEST_MODE:-0}" = 1 ]; then
+    SAFE_PATHS="${safe}" "$@"
+    return $?
+  fi
+  service_ensure_identity || return 1
+  kind="$(service_priv_drop_kind)" || {
+    print_err "需要可用的 setpriv（util-linux）、su-exec 或 su 才能以专用 mihomo 用户校验配置。"
+    return 1
+  }
+  case "${kind}" in
+    setpriv)
+      uid="$(id -u "${MIHOMO_SERVICE_USER}")" || return 1
+      gid="$(id -g "${MIHOMO_SERVICE_USER}")" || return 1
+      setpriv --reuid="${uid}" --regid="${gid}" --clear-groups -- env "SAFE_PATHS=${safe}" "$@"
+      ;;
+    su-exec)
+      su-exec "${MIHOMO_SERVICE_USER}:${MIHOMO_SERVICE_GROUP}" env "SAFE_PATHS=${safe}" "$@"
+      ;;
+    su)
+      su -s /bin/sh -c "$(service_shell_quote env "SAFE_PATHS=${safe}" "$@")" "${MIHOMO_SERVICE_USER}"
+      ;;
+  esac
+}
+
+mihomo_exec_as_user() {
+  local safe="$1" kind uid gid
+  shift
+  if [ "${MM_TEST_MODE:-0}" = 1 ]; then
+    exec env "SAFE_PATHS=${safe}" "$@"
+  fi
+  service_ensure_identity || return 1
+  kind="$(service_priv_drop_kind)" || {
+    print_err "需要可用的 setpriv（util-linux）、su-exec 或 su 才能以专用 mihomo 用户运行。"
+    return 1
+  }
+  case "${kind}" in
+    setpriv)
+      uid="$(id -u "${MIHOMO_SERVICE_USER}")" || return 1
+      gid="$(id -g "${MIHOMO_SERVICE_USER}")" || return 1
+      exec setpriv --reuid="${uid}" --regid="${gid}" --clear-groups \
+        --inh-caps=+net_bind_service,+net_raw --ambient-caps=+net_bind_service,+net_raw \
+        --bounding-set=+net_bind_service,+net_raw -- env "SAFE_PATHS=${safe}" "$@"
+      ;;
+    su-exec)
+      exec su-exec "${MIHOMO_SERVICE_USER}:${MIHOMO_SERVICE_GROUP}" env "SAFE_PATHS=${safe}" "$@"
+      ;;
+    su)
+      exec su -s /bin/sh -c "$(service_shell_quote env "SAFE_PATHS=${safe}" "$@")" "${MIHOMO_SERVICE_USER}"
+      ;;
+  esac
+}
+
+service_certificate_permissions() {
+  local cert="${1:-}" key="${2:-}" group="${MIHOMO_SERVICE_GROUP}"
+  [ "${MM_TEST_MODE:-0}" = "1" ] && return 0
+  service_ensure_identity || return 1
+  [ -n "${cert}" ] && [ -n "${key}" ] || return 1
+  [ ! -L "${cert}" ] && [ ! -L "${key}" ] || return 1
+  [ -f "${cert}" ] && [ -f "${key}" ] || return 1
+  case "${cert}" in "${CERT_DIR}"/*) ;; *) print_err "证书路径超出 CERT_DIR。"; return 1 ;; esac
+  case "${key}" in "${CERT_DIR}"/*) ;; *) print_err "私钥路径超出 CERT_DIR。"; return 1 ;; esac
+  local cert_dir key_dir
+  cert_dir="$(cd -P -- "$(dirname -- "${cert}")" && pwd)" || return 1
+  key_dir="$(cd -P -- "$(dirname -- "${key}")" && pwd)" || return 1
+  [ "${cert_dir}" = "${CERT_DIR%/}" ] && [ "${key_dir}" = "${CERT_DIR%/}" ] || { print_err "证书路径不能经过符号链接目录。"; return 1; }
+  chown root:"${group}" "${cert}" "${key}" || return 1
+  chmod 0640 "${cert}" "${key}"
+}
+
+service_ensure_identity() {
+  local nologin="/usr/sbin/nologin"
+  [ "${MM_TEST_MODE:-0}" = "1" ] && return 0
+  if ! getent group "${MIHOMO_SERVICE_GROUP}" >/dev/null 2>&1; then
+    if command_exists groupadd; then
+      groupadd --system "${MIHOMO_SERVICE_GROUP}" || return 1
+    elif command_exists addgroup; then
+      addgroup -S "${MIHOMO_SERVICE_GROUP}" || return 1
+    else
+      print_err "缺少 groupadd/addgroup，无法建立 mihomo 组。"; return 1
+    fi
+  fi
+  if ! getent passwd "${MIHOMO_SERVICE_USER}" >/dev/null 2>&1; then
+    [ -x "${nologin}" ] || nologin="/sbin/nologin"
+    if command_exists useradd; then
+      useradd --system --no-create-home --gid "${MIHOMO_SERVICE_GROUP}" --shell "${nologin}" "${MIHOMO_SERVICE_USER}" || return 1
+    elif command_exists adduser; then
+      adduser -S -D -H -G "${MIHOMO_SERVICE_GROUP}" -s "${nologin}" "${MIHOMO_SERVICE_USER}" || return 1
+    else
+      print_err "缺少 useradd/adduser，无法建立 mihomo 用户。"; return 1
+    fi
+  fi
+  local passwd_entry group_entry uid primary_gid group_gid
+  passwd_entry="$(getent passwd "${MIHOMO_SERVICE_USER}")" || return 1
+  group_entry="$(getent group "${MIHOMO_SERVICE_GROUP}")" || return 1
+  uid="$(printf '%s\n' "${passwd_entry}" | awk -F: '{print $3}')"
+  primary_gid="$(printf '%s\n' "${passwd_entry}" | awk -F: '{print $4}')"
+  group_gid="$(printf '%s\n' "${group_entry}" | awk -F: '{print $3}')"
+  [[ "${uid}" =~ ^[1-9][0-9]*$ ]] || { print_err "mihomo 用户不能是 root 或无效 UID。"; return 1; }
+  [ "${primary_gid}" = "${group_gid}" ] || { print_err "mihomo 用户必须以 mihomo 组为主组。"; return 1; }
+}
+
+# mihomo 以服务用户身份读取 BASE_DIR 下的配置，因此 BASE_DIR 的每一级父目录都必须
+# 允许该用户穿越。发行版默认 /usr/local/etc 是 0755，但有的机器被其他程序建成了
+# 0700，核心就会报 “open .../config.yaml: permission denied”。这里只补“其他用户
+# 可穿越”一位（0700→0711），不放开读权限；配置本身仍是 root:mihomo 0640。
+service_ensure_parent_traversal() {
+  local dir parent mode
+  [ -n "${BASE_DIR:-}" ] || return 1
+  dir="${BASE_DIR}"
+  while :; do
+    parent="$(dirname "${dir}")"
+    [ "${parent}" != "${dir}" ] || break
+    dir="${parent}"
+    [ "${dir}" != "/" ] || break
+    [ -d "${dir}" ] || { print_err "父目录不存在：${dir}"; return 1; }
+    mode="$(stat -c '%a' "${dir}" 2>/dev/null)" || { print_err "无法读取目录权限：${dir}"; return 1; }
+    case "${mode: -1}" in
+    1 | 3 | 5 | 7) continue ;;
+    esac
+    print_warn "父目录 ${dir} 权限 ${mode} 阻止服务用户穿越，已改为 $(printf '%o' "$((8#${mode} | 1))")。"
+    chmod o+x "${dir}" || { print_err "无法为服务用户放开父目录穿越：${dir}"; return 1; }
+  done
+}
+
+service_data_permissions() {
+  local data cert_links
+  [ "${MM_TEST_MODE:-0}" = "1" ] && return 0
+  service_ensure_identity || return 1
+  service_ensure_parent_traversal || return 1
+  data="$(mihomo_data_dir)" || return 1
+  [ ! -L "${BASE_DIR}" ] && [ ! -L "${CERT_DIR}" ] || return 1
+  install -d -o root -g "${MIHOMO_SERVICE_GROUP}" -m 0710 "${BASE_DIR}" "${CERT_DIR}" || return 1
+  install -d -o "${MIHOMO_SERVICE_USER}" -g "${MIHOMO_SERVICE_GROUP}" -m 0700 "${data}" || return 1
+  install -d -o root -g root -m 0700 "${LOG_DIR}" "${RUNTIME_DIR}" || return 1
+  [ ! -L "${CONFIG_FILE}" ] || return 1
+  [ ! -f "${CONFIG_FILE}" ] || { chown root:"${MIHOMO_SERVICE_GROUP}" "${CONFIG_FILE}" && chmod 0640 "${CONFIG_FILE}"; } || return 1
+  cert_links="$(find "${CERT_DIR}" -type l -print -quit 2>/dev/null)" || return 1
+  [ -z "${cert_links}" ] || { print_err "CERT_DIR 中不允许符号链接：${cert_links}"; return 1; }
+  find "${CERT_DIR}" -type d -exec chown root:"${MIHOMO_SERVICE_GROUP}" {} + -exec chmod 0710 {} + || return 1
+  find "${CERT_DIR}" -type f -exec chown root:"${MIHOMO_SERVICE_GROUP}" {} + -exec chmod 0640 {} + || return 1
+  chmod 0710 "${BASE_DIR}" "${CERT_DIR}" || return 1
+  chmod 0700 "${LOG_DIR}" "${RUNTIME_DIR}" || return 1
+}
+
 read_restart_count() {
   local tag="$1"
   local file="${RUNTIME_DIR}/${tag}.restart_count"
@@ -36,60 +283,114 @@ write_pid_file() {
 }
 
 read_pid_file() {
-  local pid_file="$1"
-  local content
-  [ -f "$pid_file" ] || return 1
-  content="$(tr -d ' \r\n' <"$pid_file")"
-  # PID 文件只接受纯数字，拒绝负数、特殊值与被污染的内容
-  [[ "${content}" =~ ^[0-9]+$ ]] || return 1
-  printf '%s' "${content}"
+  local pid_file="$1" content
+  [ -f "$pid_file" ] && [ ! -L "$pid_file" ] || return 1
+  content="$(tr -d ' \r\n' <"$pid_file")" || return 1
+  [[ "$content" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf "%s" "$content"
+}
+
+read_mihomo_pid_file() {
+  local identity pid birth
+  identity="$(managed_pid_read "${PID_FILE}" mihomo_process_matches)" || return 1
+  read -r pid birth <<<"${identity}"
+  printf '%s' "${pid}"
+}
+
+pid_is_zombie() {
+  [ -r "/proc/$1/stat" ] || return 1
+  [ "$(awk '{print $3}' /proc/$1/stat 2>/dev/null)" = Z ]
 }
 
 pid_matches_binary() {
-  local pid="$1"
-  local binary="$2"
-  [ -n "${pid}" ] && [ -n "${binary}" ] || return 1
-  local exe=""
-  exe="$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)"
-  [ -n "${exe}" ] || return 1
-  [ "${exe}" = "${binary}" ] || [ "${exe}" = "${binary} (deleted)" ]
+  local pid="$1" binary="$2" exe
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] && [ -n "$binary" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  pid_is_zombie "$pid" && return 1
+  exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+  [ "$exe" = "$binary" ] || [ "$exe" = "$binary (deleted)" ]
 }
 
-pid_matches_binary_or_alive() {
-  local pid="$1"
-  local binary="$2"
-  [ -n "${pid}" ] || return 1
-  kill -0 "${pid}" 2>/dev/null || return 1
-  if [ ! -d /proc ]; then
-    return 0
+pid_matches_binary_or_alive() { pid_matches_binary "$1" "$2"; }
+
+mihomo_process_matches() {
+  local pid="${1:-}" birth_before birth_after data
+  local -a proc_argv=()
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] && [ "${pid}" -gt 1 ] || return 1
+  birth_before="$(managed_proc_birth "${pid}")" || return 1
+  managed_proc_exe "${pid}" "${MIHOMO_BIN}" || return 1
+  managed_proc_argv "${pid}" || return 1
+  [ "${#proc_argv[@]}" -eq 5 ] || return 1
+  data="$(mihomo_data_dir)" || return 1
+  [ "${proc_argv[1]}" = -d ] || return 1
+  [ "${proc_argv[2]}" = "${data}" ] || [ "${proc_argv[2]}" = "${BASE_DIR}" ] || return 1
+  [ "${proc_argv[3]}" = -f ] && [ "${proc_argv[4]}" = "${CONFIG_FILE}" ] || return 1
+  birth_after="$(managed_proc_birth "${pid}")" || return 1
+  [ "${birth_before}" = "${birth_after}" ]
+}
+
+write_mihomo_pid_file() {
+  local pid="${1:-}" birth tmp i
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] && [ "${pid}" -gt 1 ] || return 1
+  birth="$(managed_proc_birth "${pid}")" || return 1
+  for ((i=0; i<50; i++)); do
+    mihomo_process_matches "${pid}" && break
+    [ "$(managed_proc_birth "${pid}" 2>/dev/null || true)" = "${birth}" ] || { print_err "mihomo 启动进程提前退出或 PID 已复用。"; return 1; }
+    sleep 0.1
+  done
+  [ "${i}" -lt 50 ] || { print_err "mihomo 未能在限定时间内执行目标二进制。"; return 1; }
+  [ "$(managed_proc_birth "${pid}")" = "${birth}" ] || return 1
+  [ ! -L "${PID_FILE}" ] || return 1
+  tmp="$(mktemp "${PID_FILE}.tmp.XXXXXX")" || return 1
+  if ! printf '%s %s\n' "${pid}" "${birth}" >"${tmp}" || ! chmod 0600 "${tmp}" || ! mv -f -- "${tmp}" "${PID_FILE}"; then
+    rm -f -- "${tmp}"
+    return 1
   fi
-  pid_matches_binary "${pid}" "${binary}"
+}
+
+stop_mihomo_candidate() {
+  local pid="${1:-}" birth="${2:-}"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] && [ "${pid}" -gt 1 ] && [[ "${birth}" =~ ^[0-9]+$ ]] || return 1
+  # Only freshly spawned candidates use this path; they may still be before exec.
+  # The recorded birth prevents a recycled PID from being signalled.
+  managed_pid_stop "${pid}" "${birth}"
+}
+
+stop_mihomo_pid_file() {
+  local pid birth identity _recorded
+  [ -e "${PID_FILE}" ] || return 0
+  [ -f "${PID_FILE}" ] && [ ! -L "${PID_FILE}" ] || { print_err "mihomo PID 文件不是普通文件；拒绝停止。"; return 1; }
+  read -r pid _recorded <"${PID_FILE}" || return 1
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] && [ "${pid}" -gt 1 ] || { print_err "mihomo PID 文件格式无效；保留文件。"; return 1; }
+  if ! kill -0 "${pid}" 2>/dev/null || pid_is_zombie "${pid}"; then rm -f -- "${PID_FILE}"; return 0; fi
+  identity="$(managed_pid_read "${PID_FILE}" mihomo_process_matches)" || { print_err "mihomo PID 身份或进程出生时间不匹配；拒绝误杀并保留 PID 文件。"; return 1; }
+  read -r pid birth <<<"${identity}"
+  managed_pid_stop "${pid}" "${birth}" || { print_err "无法确认 mihomo 进程已停止；保留 PID 文件。"; return 1; }
+  rm -f -- "${PID_FILE}"
 }
 
 kill_pid_file() {
-  local pid_file="$1"
-  local expect="${2:-}"
-  local pid
-  pid="$(read_pid_file "${pid_file}" 2>/dev/null || true)"
-  rm -f "${pid_file}"
-  [ -n "${pid}" ] || return 0
-
-  # 提供预期二进制时先做身份校验（需 /proc，root 下可用）
-  if [ -n "${expect}" ] && [ -d /proc ] && ! pid_matches_binary "${pid}" "${expect}"; then
-    if kill -0 "${pid}" 2>/dev/null; then
-      print_warn "PID ${pid} 已不属于 ${expect}（疑似 PID 复用），跳过终止。"
-    fi
-    return 0
+  local pid_file="$1" expect="$2" pid n
+  pid="$(read_pid_file "$pid_file" 2>/dev/null || true)"
+  [ -n "$pid" ] || { rm -f -- "$pid_file"; return 0; }
+  if [ -n "$expect" ] && ! pid_matches_binary "$pid" "$expect"; then
+    if kill -0 "$pid" 2>/dev/null && ! pid_is_zombie "$pid"; then print_warn "PID $pid 不属于预期程序 $expect；拒绝误杀。"; return 1; fi
+    rm -f -- "$pid_file"; return 0
   fi
-
-  kill "${pid}" >/dev/null 2>&1 || return 0
-  # TERM 后等待退出，最多 5 秒，仍存活则 KILL
-  for _ in 1 2 3 4 5; do
-    kill -0 "${pid}" 2>/dev/null || return 0
+  kill -TERM "$pid" >/dev/null 2>&1 || { kill -0 "$pid" 2>/dev/null && return 1; }
+  for n in 1 2 3 4 5; do
+    if ! kill -0 "$pid" 2>/dev/null || pid_is_zombie "$pid"; then rm -f -- "$pid_file"; return 0; fi
     sleep 1
   done
-  kill -9 "${pid}" >/dev/null 2>&1 || true
-  return 0
+  if kill -0 "$pid" 2>/dev/null && ! pid_is_zombie "$pid"; then
+    kill -KILL "$pid" >/dev/null 2>&1 || return 1
+    for n in 1 2 3 4 5; do
+      if ! kill -0 "$pid" 2>/dev/null || pid_is_zombie "$pid"; then rm -f -- "$pid_file"; return 0; fi
+      sleep 1
+    done
+    print_err "PID $pid 收到 KILL 后仍存活，保留 PID 文件。"; return 1
+  fi
+  rm -f -- "$pid_file"
 }
 
 compute_go_mem_limit_mb() {
@@ -148,32 +449,22 @@ systemd_timer_active() {
 }
 
 create_systemd_units() {
-  local mem_line=""
-  local mem_limit gogc_line memory_high_line memory_max_line nofile_line
-  local mem_high mem_max
-  mem_limit="$(go_mem_limit_value)"
-  if [ -n "${mem_limit}" ]; then
-    mem_line="Environment=GOMEMLIMIT=${mem_limit}"
-  fi
-  # P5：GOGC=off 彻底关闭逃逸堆目标（可选）；MemoryHigh/MemoryMax 软硬内存上限（可选）
+  local mem_line="" mem_limit gogc_line memory_high_line memory_max_line nofile_line
+  local mem_high mem_max safe data
+  service_data_permissions || return 1
+  safe="$(mihomo_safe_paths)" || return 1
+  data="$(mihomo_data_dir)" || return 1
+  mem_limit="$(go_mem_limit_value)" || return 1
+  [ -z "${mem_limit}" ] || mem_line="Environment=GOMEMLIMIT=${mem_limit}"
   gogc_line=""
-  if go_gc_requested; then
-    gogc_line="Environment=GOGC=off"
-  fi
-  mem_high="$(manager_env_or_setting "mem_high_mb")"
-  mem_max="$(manager_env_or_setting "mem_max_mb")"
-  memory_high_line=""
-  memory_max_line=""
-  if [ -n "${mem_high}" ] && [[ "${mem_high}" =~ ^[0-9]+$ ]] && [ "${mem_high}" -gt 0 ]; then
-    memory_high_line="MemoryHigh=${mem_high}M"
-  fi
-  if [ -n "${mem_max}" ] && [[ "${mem_max}" =~ ^[0-9]+$ ]] && [ "${mem_max}" -gt 0 ]; then
-    memory_max_line="MemoryMax=${mem_max}M"
-  fi
-  # P2：放宽文件描述符上限，适配高连接数
+  if go_gc_requested; then gogc_line="Environment=GOGC=off"; fi
+  mem_high="$(manager_env_or_setting "mem_high_mb")" || return 1
+  mem_max="$(manager_env_or_setting "mem_max_mb")" || return 1
+  memory_high_line=""; memory_max_line=""
+  if [ -n "${mem_high}" ] && [[ "${mem_high}" =~ ^[0-9]+$ ]] && [ "${mem_high}" -gt 0 ]; then memory_high_line="MemoryHigh=${mem_high}M"; fi
+  if [ -n "${mem_max}" ] && [[ "${mem_max}" =~ ^[0-9]+$ ]] && [ "${mem_max}" -gt 0 ]; then memory_max_line="MemoryMax=${mem_max}M"; fi
   nofile_line="LimitNOFILE=1048576"
-
-  cat >"${SYSTEMD_SERVICE_FILE}" <<EOF
+  cat >"${SYSTEMD_SERVICE_FILE}" <<EOF || return 1
 [Unit]
 Description=Mihomo Manager
 After=network-online.target
@@ -181,15 +472,18 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=${BASE_DIR}
-ExecStartPre=/bin/mkdir -p ${BASE_DIR}/logs ${RUNTIME_DIR}
-ExecStartPre=${MIHOMO_BIN} -t -f ${CONFIG_FILE}
+User=${MIHOMO_SERVICE_USER}
+Group=${MIHOMO_SERVICE_GROUP}
+WorkingDirectory=${data}
+Environment=SAFE_PATHS=${safe}
+ExecStartPre=+${MM_CLI} fw protect
+ExecStartPre=${MIHOMO_BIN} -d ${data} -t -f ${CONFIG_FILE}
 ${mem_line}
 ${gogc_line}
 ${memory_high_line}
 ${memory_max_line}
 ${nofile_line}
-ExecStart=${MIHOMO_BIN} -d ${BASE_DIR} -f ${CONFIG_FILE}
+ExecStart=${MIHOMO_BIN} -d ${data} -f ${CONFIG_FILE}
 Restart=on-failure
 UMask=0077
 NoNewPrivileges=yes
@@ -205,26 +499,27 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
-# 5.1：纵深加固——系统调用白名单裁剪 + EPERM 静默 + 能力边界只留网络授权；
-#   地址族收窄（AF_NETLINK 为 auto_detect_interface 路由探测所需保留）
 SystemCallFilter=@system-service
 SystemCallFilter=~@chown
 SystemCallFilter=~@privileged
 SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 OOMPolicy=kill
 OOMScoreAdjust=-100
 RestartSteps=10
 RestartSec=3
 MemorySwapMax=0
-ReadWritePaths=${BASE_DIR} ${LIB_DIR}
+ReadOnlyPaths=${BASE_DIR} ${CERT_DIR}
+ReadWritePaths=${data}
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-  cat >"${SYSTEMD_WATCHDOG_SERVICE_FILE}" <<EOF
+  [ -s "${SYSTEMD_SERVICE_FILE}" ] || return 1
+  chmod 0644 "${SYSTEMD_SERVICE_FILE}" || return 1
+  cat >"${SYSTEMD_WATCHDOG_SERVICE_FILE}" <<EOF || return 1
 [Unit]
 Description=Mihomo Manager Watchdog
 After=network-online.target
@@ -244,14 +539,14 @@ ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectProc=invisible
 ProcSubset=pid
-ReadWritePaths=${BASE_DIR} ${LIB_DIR}
+ReadWritePaths=${BASE_DIR} ${LOCK_ROOT}
 EOF
-
-  cat >"${SYSTEMD_WATCHDOG_TIMER_FILE}" <<EOF
+  [ -s "${SYSTEMD_WATCHDOG_SERVICE_FILE}" ] || return 1
+  chmod 0644 "${SYSTEMD_WATCHDOG_SERVICE_FILE}" || return 1
+  cat >"${SYSTEMD_WATCHDOG_TIMER_FILE}" <<EOF || return 1
 [Unit]
 Description=Run Mihomo Manager Watchdog Every Minute
 
-# C1：开机首检 90s→30s（端口探活并行后单轮足够快，提前拉起可缩短故障窗口）
 [Timer]
 OnBootSec=30
 OnUnitActiveSec=60
@@ -260,54 +555,60 @@ Unit=${WATCHDOG_SERVICE_NAME}.service
 [Install]
 WantedBy=timers.target
 EOF
-
-  systemctl daemon-reload
-  systemctl enable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
-  systemctl enable --now "${WATCHDOG_TIMER_NAME}" >/dev/null 2>&1 || true
+  [ -s "${SYSTEMD_WATCHDOG_TIMER_FILE}" ] || return 1
+  chmod 0644 "${SYSTEMD_WATCHDOG_TIMER_FILE}" || return 1
+  systemctl daemon-reload || return 1
+  systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || return 1
+  if [ "${MM_DEFER_WATCHDOG_ENABLE:-0}" != 1 ]; then ensure_watchdog_enabled || return 1; fi
 }
 
 create_openrc_units() {
-  local mem_line gogc_line
-  local mem_limit
-  mem_line=""
-  gogc_line=""
-  mem_limit="$(go_mem_limit_value)"
-  if [ -n "${mem_limit}" ]; then
-    mem_line="export GOMEMLIMIT=${mem_limit}"
-  fi
-  if go_gc_requested; then
-    gogc_line="export GOGC=off"
-  fi
-
-  cat >"${OPENRC_SERVICE_FILE}" <<EOF
+  local mem_line="" gogc_line="" mem_limit safe data
+  service_data_permissions || return 1
+  safe="$(mihomo_safe_paths)" || return 1
+  data="$(mihomo_data_dir)" || return 1
+  mem_limit="$(go_mem_limit_value)" || return 1
+  [ -z "${mem_limit}" ] || mem_line="export GOMEMLIMIT=${mem_limit}"
+  if go_gc_requested; then gogc_line="export GOGC=off"; fi
+  cat >"${OPENRC_SERVICE_FILE}" <<EOF || return 1
 #!/sbin/openrc-run
-
 name="${SERVICE_NAME}"
 description="Mihomo Manager"
 command="${MIHOMO_BIN}"
-command_args="-d ${BASE_DIR} -f ${CONFIG_FILE}"
+command_args="-d ${data} -f ${CONFIG_FILE}"
 command_background=true
+command_user="${MIHOMO_SERVICE_USER}:${MIHOMO_SERVICE_GROUP}"
 pidfile="${PID_FILE}"
+export SAFE_PATHS="${safe}"
 
-depend() {
+ depend() {
   need net
 }
 
 start_pre() {
-  mkdir -p ${BASE_DIR}/logs ${RUNTIME_DIR}
-  ${MIHOMO_BIN} -d ${BASE_DIR} -t -f ${CONFIG_FILE} >/dev/null
+  install -d -o ${MIHOMO_SERVICE_USER} -g ${MIHOMO_SERVICE_GROUP} -m 0700 ${data} || return 1
+  ${MM_CLI} fw protect || return 1
+  ${MIHOMO_BIN} -d ${data} -t -f ${CONFIG_FILE} >/dev/null || return 1
   ${mem_line}
   ${gogc_line}
 }
 EOF
+  [ -s "${OPENRC_SERVICE_FILE}" ] || return 1
+  chmod 0755 "${OPENRC_SERVICE_FILE}" || return 1
+  rc-update add "${SERVICE_NAME}" default >/dev/null 2>&1 || return 1
+  if [ "${MM_DEFER_WATCHDOG_ENABLE:-0}" != 1 ]; then ensure_watchdog_enabled || return 1; fi
+}
 
-  chmod 0755 "${OPENRC_SERVICE_FILE}"
-  rc-update add "${SERVICE_NAME}" default >/dev/null 2>&1 || true
-
-  if command_exists rc-service && [ -x /etc/init.d/crond ]; then
-    rc-update add crond default >/dev/null 2>&1 || true
-    rc-service crond start >/dev/null 2>&1 || true
+ensure_watchdog_enabled() {
+  if systemd_available; then
+    systemctl enable --now "${WATCHDOG_TIMER_NAME}" >/dev/null 2>&1 || return 1
+    return 0
   fi
+  if openrc_available && command_exists rc-service && [ -x /etc/init.d/crond ]; then
+    rc-update add crond default >/dev/null 2>&1 || return 1
+    rc-service crond start >/dev/null 2>&1 || return 1
+  fi
+  create_cron_watchdog
 }
 
 create_cron_watchdog() {
@@ -342,7 +643,7 @@ service_state() {
   fi
 
   local pid
-  pid="$(read_pid_file "${PID_FILE}" 2>/dev/null || true)"
+  pid="$(read_mihomo_pid_file 2>/dev/null || true)"
   # 存活且确为 mihomo 实例才显示运行中，防止 PID 复用导致误报
   if [ -n "${pid}" ] && pid_matches_binary_or_alive "${pid}" "${MIHOMO_BIN}"; then
     printf '运行中'
@@ -351,80 +652,120 @@ service_state() {
   fi
 }
 
-socks5_whitelist_cleanup() {
-  local chain="MM_SOCKS5_WL" ipt nums n
-  command_exists iptables || return 0
-  for ipt in iptables ip6tables; do
-    command_exists "${ipt}" || continue
-    # 按行号删除 INPUT 中跳转到本链的规则；规则包含 --dport 等参数时
-    # 不能用 "-D INPUT -j chain" 精确匹配，否则旧规则会残留。
-    nums="$("${ipt}" -L INPUT --line-numbers -n 2>/dev/null | awk -v c="${chain}" '$2 == c {print $1}' | sort -rn)"
-    for n in ${nums}; do
-      "${ipt}" -D INPUT "${n}" >/dev/null 2>&1 || true
-    done
-    "${ipt}" -F "${chain}" >/dev/null 2>&1 || true
-    "${ipt}" -X "${chain}" >/dev/null 2>&1 || true
-  done
+socks5_whitelist_guard() {
+  local port="$1" enabled tags tag proto node_port found=0
+  [[ "$port" =~ ^[1-9][0-9]*$ ]] && [ "$port" -le 65535 ] || return 1
+  enabled="$(manager_env_or_setting "socks5_wl_flag" "")" || return 1
+  case "${enabled,,}" in true|1|yes|on) ;; *) return 0 ;; esac
+  tags="$(iter_node_tags)" || return 1
+  while IFS= read -r tag; do
+    [ -n "$tag" ] || continue
+    proto="$(node_value "$tag" protocol)" || return 1
+    [ "$proto" = socks5 ] || continue
+    node_port="$(node_value "$tag" port)" || return 1
+    [[ "$node_port" =~ ^[1-9][0-9]*$ ]] && [ "$node_port" -le 65535 ] || return 1
+    [ "$node_port" = "$port" ] && found=1
+  done <<< "$tags"
+  [ "$found" = 1 ] && return 2
+  return 0
 }
 
-# 仅用 iptables 做源地址白名单；没有 iptables 的环境只告警，不影响节点本身。
-socks5_whitelist_apply() {
-  local enabled ips ip port tag proto chain="MM_SOCKS5_WL" ipt
-  enabled="$(manager_env_or_setting "socks5_wl_flag" "")"
-  case "${enabled,,}" in
-  true | 1 | yes | on) ;;
-  *) socks5_whitelist_cleanup; return 0 ;;
-  esac
-  if ! command_exists iptables; then
-    print_warn "socks5 白名单需要 iptables，当前系统不可用，未应用。"
-    return 0
+socks5_whitelist_remove_chain() {
+  local ipt="$1" chain="$2" listing nums n rc=0
+  listing="$("$ipt" -L INPUT --line-numbers -n 2>/dev/null)" || return 1
+  nums="$(printf '%s\n' "$listing" | awk -v c="$chain" '$2 == c {print $1}' | sort -rn)" || return 1
+  for n in $nums; do "$ipt" -D INPUT "$n" >/dev/null 2>&1 || rc=1; done
+  [ "$rc" = 0 ] || return 1
+  if "$ipt" -L "$chain" -n >/dev/null 2>&1; then
+    "$ipt" -F "$chain" >/dev/null 2>&1 || return 1
+    "$ipt" -X "$chain" >/dev/null 2>&1 || return 1
   fi
-  ips="$(manager_env_or_setting "socks5_ips" "")"
-  if [ -z "${ips}" ]; then
-    print_warn "socks5_wl_flag 已开启但 socks5_ips 为空，未应用白名单。"
-    socks5_whitelist_cleanup
-    return 0
-  fi
-  socks5_whitelist_cleanup
+}
+
+socks5_whitelist_cleanup() {
+  local ipt chain rc=0
   for ipt in iptables ip6tables; do
-    command_exists "${ipt}" || continue
-    "${ipt}" -N "${chain}" >/dev/null 2>&1 || true
-    "${ipt}" -F "${chain}" >/dev/null 2>&1 || true
-    for ip in ${ips//,/ }; do
-      [ -n "${ip}" ] || continue
-      "${ipt}" -A "${chain}" -s "${ip}" -j ACCEPT >/dev/null 2>&1 || true
+    command_exists "$ipt" || continue
+    for chain in MM_SOCKS5_WL_A MM_SOCKS5_WL_B MM_SOCKS5_WL; do
+      socks5_whitelist_remove_chain "$ipt" "$chain" || rc=1
     done
-    "${ipt}" -A "${chain}" -j DROP >/dev/null 2>&1 || true
   done
+  return "$rc"
+}
+
+socks5_whitelist_apply() {
+  local enabled ips token ip ipt chain old_chain tags tag proto port rules active_a active_b rc=0 item
+  local -a v4=() v6=() ports=() staged=()
+  enabled="$(manager_env_or_setting "socks5_wl_flag" "")" || return 1
+  case "${enabled,,}" in true|1|yes|on) ;; *) socks5_whitelist_cleanup; return $? ;; esac
+  ips="$(manager_env_or_setting "socks5_ips" "")" || return 1
+  ips="${ips//,/ }"
+  [ -n "${ips//[[:space:]]/}" ] || { print_err "白名单已启用但地址列表为空，拒绝启动。"; return 1; }
+  for token in $ips; do
+    [[ "$token" =~ ^[0-9A-Fa-f.:/]+$ ]] || { print_err "白名单地址格式无效：$token"; return 1; }
+    if [[ "$token" == *:* ]]; then v6+=("$token"); else v4+=("$token"); fi
+  done
+  command_exists iptables || { print_err "白名单已启用但缺少 iptables，拒绝启动。"; return 1; }
+  command_exists ip6tables || { print_err "白名单已启用但缺少 ip6tables，拒绝启动。"; return 1; }
+  tags="$(iter_node_tags)" || return 1
   while IFS= read -r tag; do
-    [ -n "${tag}" ] || continue
-    proto="$(node_value "${tag}" "protocol")"
-    [ "${proto}" = "socks5" ] || continue
-    port="$(node_value "${tag}" "port")"
-    [[ "${port}" =~ ^[0-9]+$ ]] || continue
-    for ipt in iptables ip6tables; do
-      command_exists "${ipt}" || continue
-      "${ipt}" -I INPUT -p tcp --dport "${port}" -m comment --comment "mm_socks5_wl" -j "${chain}" >/dev/null 2>&1 || true
+    [ -n "$tag" ] || continue
+    proto="$(node_value "$tag" protocol)" || return 1
+    [ "$proto" = socks5 ] || continue
+    port="$(node_value "$tag" port)" || return 1
+    [[ "$port" =~ ^[1-9][0-9]*$ ]] && [ "$port" -le 65535 ] || { print_err "SOCKS5 节点端口无效：$tag"; return 1; }
+    ports+=("$port")
+  done <<< "$tags"
+  [ "${#ports[@]}" -gt 0 ] || { print_err "白名单已启用但没有 SOCKS5 节点。"; return 1; }
+  for ipt in iptables ip6tables; do
+    rules="$("$ipt" -S INPUT 2>/dev/null)" || { print_err "$ipt 无法检查 INPUT 链，拒绝启动。"; return 1; }
+    active_a=0; active_b=0
+    grep -Eq '^-A INPUT .* -j MM_SOCKS5_WL_A([[:space:]]|$)' <<< "$rules" && active_a=1 || true
+    grep -Eq '^-A INPUT .* -j MM_SOCKS5_WL_B([[:space:]]|$)' <<< "$rules" && active_b=1 || true
+    [ "$active_a" = 0 ] || [ "$active_b" = 0 ] || { print_err "$ipt 检测到多个活动白名单链，拒绝不安全重建。"; return 1; }
+    if [ "$active_a" = 1 ]; then old_chain=MM_SOCKS5_WL_A; chain=MM_SOCKS5_WL_B; elif [ "$active_b" = 1 ]; then old_chain=MM_SOCKS5_WL_B; chain=MM_SOCKS5_WL_A; else old_chain=""; chain=MM_SOCKS5_WL_A; fi
+    "$ipt" -N "$chain" >/dev/null 2>&1 || "$ipt" -F "$chain" >/dev/null 2>&1 || return 1
+    "$ipt" -F "$chain" >/dev/null 2>&1 || return 1
+    if [ "$ipt" = iptables ]; then
+      for ip in "${v4[@]}"; do "$ipt" -A "$chain" -s "$ip" -j ACCEPT >/dev/null 2>&1 || { "$ipt" -F "$chain" >/dev/null 2>&1 || true; return 1; }; done
+    else
+      for ip in "${v6[@]}"; do "$ipt" -A "$chain" -s "$ip" -j ACCEPT >/dev/null 2>&1 || { "$ipt" -F "$chain" >/dev/null 2>&1 || true; return 1; }; done
+    fi
+    "$ipt" -A "$chain" -j DROP >/dev/null 2>&1 || { "$ipt" -F "$chain" >/dev/null 2>&1 || true; return 1; }
+    staged+=("$ipt:$chain:$old_chain")
+  done
+  for item in "${staged[@]}"; do
+    IFS=: read -r ipt chain old_chain <<< "$item"
+    for port in "${ports[@]}"; do
+      for proto in tcp udp; do
+        "$ipt" -I INPUT 1 -p "$proto" --dport "$port" -m comment --comment mm_socks5_wl -j "$chain" >/dev/null 2>&1 || rc=1
+      done
     done
-  done < <(iter_node_tags)
+    [ "$rc" = 0 ] || break
+  done
+  if [ "$rc" != 0 ]; then
+    for item in "${staged[@]}"; do IFS=: read -r ipt chain old_chain <<< "$item"; socks5_whitelist_remove_chain "$ipt" "$chain" || true; done
+    print_err "安装 SOCKS5 白名单规则失败，拒绝启动。"; return 1
+  fi
+  for item in "${staged[@]}"; do
+    IFS=: read -r ipt chain old_chain <<< "$item"
+    if [ -n "$old_chain" ]; then socks5_whitelist_remove_chain "$ipt" "$old_chain" || { print_err "新白名单已安装但旧规则无法清理；拒绝报告成功。"; return 1; }; fi
+    socks5_whitelist_remove_chain "$ipt" MM_SOCKS5_WL || return 1
+  done
+  return 0
 }
 
 stop_service() {
-  local log_file="${BASE_DIR}/logs/mihomo.log" reason_file="${BASE_DIR}/logs/stop_reason.log"
-  if [ -s "${log_file}" ]; then
-    tail -n 50 "${log_file}" >"${reason_file}" 2>/dev/null || true
-    chmod 600 "${reason_file}" 2>/dev/null || true
-  fi
-  socks5_whitelist_cleanup || true
-  if systemd_available; then
-    systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
-  elif openrc_available; then
-    rc-service "${SERVICE_NAME}" stop >/dev/null 2>&1 || true
-    kill_pid_file "${PID_FILE}" "${MIHOMO_BIN}"
-  else
-    kill_pid_file "${PID_FILE}" "${MIHOMO_BIN}"
-  fi
+  local log_file="${BASE_DIR}/logs/mihomo.log" reason_file="${BASE_DIR}/logs/stop_reason.log" rc=0
+  if [ -s "$log_file" ]; then tail -n 50 "$log_file" >"$reason_file" 2>/dev/null || true; chmod 600 "$reason_file" 2>/dev/null || true; fi
+  if systemd_available; then systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || rc=1
+  elif openrc_available; then rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || rc=1; fi
+  stop_mihomo_pid_file || rc=1
+  if [ "$rc" = 0 ]; then socks5_whitelist_cleanup || rc=1; fi
+  return "$rc"
 }
+
+
 
 ensure_low_memory_guard() {
   local total_kb avail_mb low_mb
@@ -448,7 +789,7 @@ running_singbox_pid() {
     printf '%s' "${pid}"
     return 0
   fi
-  pid="$(read_pid_file "${PID_FILE}" 2>/dev/null || true)"
+  pid="$(read_mihomo_pid_file 2>/dev/null || true)"
   [ -n "${pid}" ] || return 1
   printf '%s' "${pid}"
   return 0
@@ -460,33 +801,40 @@ running_singbox_pid() {
 #   - 服务未运行 → 直接完整启动。
 #   就绪自检（P3）在非测试环境于重启后执行，端口未监听时给出明确报错。
 reload_service() {
-  if ! "${MIHOMO_BIN}" -t -f "${CONFIG_FILE}" >/dev/null 2>&1; then
-    print_err "配置校验失败，已拒绝重载（保留现有运行配置）。"
-    return 1
-  fi
-  if [ -n "$(running_singbox_pid 2>/dev/null || true)" ]; then
-    print_info "配置校验通过，重启 mihomo 以应用新配置（走 stop+start）。"
-  else
-    print_info "服务未运行，直接启动。"
-  fi
-  stop_service
-  start_service
-  if [ "${MM_TEST_MODE:-0}" != "1" ]; then
-    verify_data_plane_ready || true
-  fi
+  mihomo_validate "$CONFIG_FILE" || { print_err "配置校验失败，拒绝重载。"; return 1; }
+  stop_service || { print_err "停止旧服务失败，拒绝启动新配置。"; return 1; }
+  start_service || { print_err "新服务启动失败。"; return 1; }
+  if [ "${MM_TEST_MODE:-0}" != 1 ]; then verify_data_plane_ready || { stop_service || true; return 1; }; fi
   return 0
+}
+
+
+
+# 就绪重试次数的默认值：普通主机 10 次（每次探活 1s、间隔 1s），低内存主机
+# （MemTotal < 256MB）30 次。128MB 的 NAT 小机在负载高时冷启动 mihomo 常超过 10s，
+# 固定 10 次会误判“数据面就绪失败”并回滚（BR-Oracle-nat 实测连续两次）。
+mm_default_readiness_retries() {
+  local mem_kb=0 meminfo="${MM_MEMINFO_FILE:-/proc/meminfo}"
+  if [ -r "${meminfo}" ]; then
+    mem_kb="$(awk '/^MemTotal:/{print $2; exit}' "${meminfo}" 2>/dev/null || printf 0)"
+  fi
+  if [[ "${mem_kb}" =~ ^[0-9]+$ ]] && [ "${mem_kb}" -gt 0 ] && [ "${mem_kb}" -lt 262144 ]; then
+    printf '30'
+    return 0
+  fi
+  printf '10'
 }
 
 # P3：等待一组 TCP 端口可探活（就绪自检核心，MM_READINESS_RETRIES 次重试，
 # 每次探活 1s 超时、间隔 1s）。UDP 节点不在此列（见 verify_data_plane_ready）。
 await_tcp_ports() {
-  local host="$1" ports="$2" tries="${3:-${MM_READINESS_RETRIES:-3}}"
+  local host="$1" port_list="$2" tries="${3:-${MM_READINESS_RETRIES:-$(mm_default_readiness_retries)}}"
   local attempt port all_ok
-  [ -n "${ports}" ] || return 0
-  [[ "${tries}" =~ ^[1-9][0-9]*$ ]] || tries=3
+  [ -n "${port_list}" ] || return 0
+  [[ "${tries}" =~ ^[1-9][0-9]*$ ]] || tries="$(mm_default_readiness_retries)"
   for ((attempt = 1; attempt <= tries; attempt++)); do
     all_ok=1
-    for port in ${ports}; do
+    for port in ${port_list}; do
       [[ "${port}" =~ ^[0-9]+$ ]] || continue
       if ! probe_tcp_port "${host}" "${port}" 1; then
         all_ok=0
@@ -503,82 +851,112 @@ await_tcp_ports() {
 # 未监听时明确报出端口（端口冲突/绑定失败定位）；纯 UDP（hy2/tuic）节点
 # 与全 UDP 部署跳过（TCP 探活不适用，进程存活由 watchdog 保证）。
 verify_data_plane_ready() {
-  # 全节点仅需 protocol/port 两字段：用 node_meta_bulk 一次 jq 拿到（9.3 jq 批量化）
-  # 字段顺序同 node_value：protocol / port；node_meta_bulk 输出 4 列，argo_mode 用占位列吸收（F-09）
-  local tag protocol port _argo ports="" tcp_count
-  [ -f "${NODES_FILE}" ] || return 0
+  local rows tag protocol port tcp_ports="" udp_ports="" tcp_count udp_count attempt all_ok p rc=0
+  [ -f "$NODES_FILE" ] || return 0
+  rows="$(node_meta_bulk)" || { print_err "无法读取节点元数据进行就绪检查。"; return 1; }
   while IFS=$'\t' read -r tag protocol port _argo; do
-    [ -n "${tag}" ] || continue
-    case "${protocol}" in
-    vless-reality | vless-xudp | vless-ws-tls | anytls | vless-argo | socks5)
-      ports="${ports} ${port}"
-      ;;
-    esac
-  done < <(node_meta_bulk)
-  tcp_count="$(tcp_probeable_node_count)"
-  if [ "${tcp_count}" -eq 0 ]; then
-    print_info "当前无 TCP 类入站节点（均为 UDP 或空），跳过端口就绪探活。"
-    return 0
+    [ -n "$tag" ] || continue
+    [[ "$port" =~ ^[1-9][0-9]*$ ]] && [ "$port" -le 65535 ] || { print_err "节点 $tag 端口无效。"; return 1; }
+    tcp_probeable_protocol "$protocol" && tcp_ports="$tcp_ports $port"
+    udp_probeable_protocol "$protocol" && udp_ports="$udp_ports $port"
+  done <<< "$rows"
+  tcp_count="$(tcp_probeable_node_count)" || return 1
+  udp_count="$(udp_node_count)" || return 1
+  if [ "$tcp_count" -gt 0 ]; then await_tcp_ports 127.0.0.1 "${tcp_ports# }" "${MM_READINESS_RETRIES:-$(mm_default_readiness_retries)}" || rc=1; fi
+  if [ "$udp_count" -gt 0 ]; then
+    command_exists ss || command_exists netstat || { print_err "UDP 就绪检查需要 ss 或 netstat。"; return 1; }
+    local retries="${MM_READINESS_RETRIES:-$(mm_default_readiness_retries)}"
+    [[ "$retries" =~ ^[1-9][0-9]*$ ]] || { print_err "MM_READINESS_RETRIES 必须为正整数。"; return 1; }
+    for ((attempt=1; attempt<=retries;attempt++)); do
+      all_ok=1
+      for p in ${udp_ports# }; do udp_port_binding_alive "$p" || { all_ok=0; break; }; done
+      [ "$all_ok" = 1 ] && break
+      sleep 1
+    done
+    [ "$all_ok" = 1 ] || rc=1
   fi
-  ports="${ports# }"
-  if await_tcp_ports "127.0.0.1" "${ports}" 3; then
-    print_ok "数据面就绪：${tcp_count} 个 TCP 入站端口可探测。"
-    return 0
-  fi
-  print_err "数据面就绪自检失败：TCP 入站端口未监听或存在冲突。端口：${ports}"
-  print_err "可用 ss -ltnup 检查占用情况；确认冲突后调整节点端口并重新应用。"
-  return 1
+  [ "$rc" = 0 ] || { print_err "数据面就绪失败：TCP(${tcp_ports# }) UDP(${udp_ports# }) 监听未确认。"; return 1; }
+  print_ok "数据面就绪：TCP $tcp_count 个，UDP $udp_count 个。"
 }
 
+
+
 start_service() {
-  [ -x "${MIHOMO_BIN}" ] || fatal "尚未安装 mihomo。"
-  rotate_log_file "${BASE_DIR}/logs/mihomo.log" || true
-  "${MIHOMO_BIN}" -t -f "${CONFIG_FILE}" >/dev/null
-  warn_if_bindv6only
-
-  local mem_limit
-  mem_limit="$(go_mem_limit_value)"
-
+  [ -x "$MIHOMO_BIN" ] || { print_err "尚未安装 mihomo。"; return 1; }
+  service_data_permissions || return 1
+  socks5_whitelist_apply || { print_err "SOCKS5 白名单安装失败，拒绝启动。"; return 1; }
+  mihomo_validate "$CONFIG_FILE" || return 1
+  warn_if_bindv6only || return 1
+  local mem_limit data safe pid gid launch_birth
+  mem_limit="$(go_mem_limit_value)" || return 1
+  data="$(mihomo_data_dir)" || return 1
+  safe="$(mihomo_safe_paths)" || return 1
   if systemd_available; then
-    systemctl daemon-reload
-    systemctl restart "${SERVICE_NAME}" >/dev/null 2>&1 || systemctl start "${SERVICE_NAME}" >/dev/null 2>&1
-    systemctl enable --now "${WATCHDOG_TIMER_NAME}" >/dev/null 2>&1 || true
+    create_systemd_units || return 1
+    systemctl daemon-reload || return 1
+    systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || return 1
   elif openrc_available; then
-    stop_service
-    rc-service "${SERVICE_NAME}" restart >/dev/null 2>&1 || rc-service "${SERVICE_NAME}" start >/dev/null 2>&1
+    create_openrc_units || return 1
+    rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 || rc-service "$SERVICE_NAME" start >/dev/null 2>&1 || return 1
   else
-    stop_service
-    local env_prefix=()
-    if [ -n "${mem_limit}" ]; then
-      env_prefix+=(GOMEMLIMIT="${mem_limit}")
-    fi
-    # P5：可选 GOGC=off（彻底关闭逃逸堆目标，适合希望避免频繁 GC 的场景）
-    if go_gc_requested; then
-      env_prefix+=(GOGC="off")
-    fi
-    if [ "${#env_prefix[@]}" -gt 0 ]; then
-      nohup env "${env_prefix[@]}" "${MIHOMO_BIN}" run -d "${BASE_DIR}" -f "${CONFIG_FILE}" >>"${BASE_DIR}/logs/mihomo.log" 2>&1 &
+    stop_service || return 1
+    socks5_whitelist_apply || return 1
+    local -a env_prefix=()
+    [ -z "$mem_limit" ] || env_prefix+=("GOMEMLIMIT=$mem_limit")
+    if go_gc_requested; then env_prefix+=(GOGC=off); fi
+    if [ "${MM_TEST_MODE:-0}" = 1 ]; then
+      ( if [[ "${LOCK_FD:-}" =~ ^[0-9]+$ ]]; then exec {LOCK_FD}>&-; fi; trap '' HUP; exec nohup env "${env_prefix[@]}" SAFE_PATHS="$safe" "$MIHOMO_BIN" -d "$data" -f "$CONFIG_FILE" ) >>"$BASE_DIR/logs/mihomo.log" 2>&1 &
     else
-      nohup "${MIHOMO_BIN}" run -d "${BASE_DIR}" -f "${CONFIG_FILE}" >>"${BASE_DIR}/logs/mihomo.log" 2>&1 &
+      service_ensure_identity || return 1
+      local priv_kind uid
+      priv_kind="$(service_priv_drop_kind)" || {
+        print_err "独立启动需要可用的 setpriv（util-linux）、su-exec 或 su。"
+        return 1
+      }
+      case "$priv_kind" in
+        setpriv)
+          uid="$(id -u "$MIHOMO_SERVICE_USER")" || return 1
+          gid="$(id -g "$MIHOMO_SERVICE_USER")" || return 1
+          [[ "$uid" =~ ^[0-9]+$ ]] && [[ "$gid" =~ ^[0-9]+$ ]] || return 1
+          ( if [[ "${LOCK_FD:-}" =~ ^[0-9]+$ ]]; then exec {LOCK_FD}>&-; fi; trap '' HUP; exec nohup env "${env_prefix[@]}" SAFE_PATHS="$safe" setpriv --reuid="$uid" --regid="$gid" --clear-groups --inh-caps=+net_bind_service,+net_raw --ambient-caps=+net_bind_service,+net_raw --bounding-set=+net_bind_service,+net_raw -- "$MIHOMO_BIN" -d "$data" -f "$CONFIG_FILE" ) >>"$BASE_DIR/logs/mihomo.log" 2>&1 &
+          ;;
+        su-exec)
+          ( if [[ "${LOCK_FD:-}" =~ ^[0-9]+$ ]]; then exec {LOCK_FD}>&-; fi; trap '' HUP; exec nohup env "${env_prefix[@]}" SAFE_PATHS="$safe" su-exec "$MIHOMO_SERVICE_USER:$MIHOMO_SERVICE_GROUP" "$MIHOMO_BIN" -d "$data" -f "$CONFIG_FILE" ) >>"$BASE_DIR/logs/mihomo.log" 2>&1 &
+          ;;
+        su)
+          ( if [[ "${LOCK_FD:-}" =~ ^[0-9]+$ ]]; then exec {LOCK_FD}>&-; fi; trap '' HUP; exec nohup env "${env_prefix[@]}" SAFE_PATHS="$safe" su -s /bin/sh -c "$(service_shell_quote env "SAFE_PATHS=$safe" "$MIHOMO_BIN" -d "$data" -f "$CONFIG_FILE")" "$MIHOMO_SERVICE_USER" ) >>"$BASE_DIR/logs/mihomo.log" 2>&1 &
+          ;;
+      esac
     fi
-    write_pid_file "${PID_FILE}" "$!"
+    pid=$!
+    launch_birth="$(managed_proc_birth "${pid}" 2>/dev/null)" || { print_err "无法确认候选 mihomo 进程身份。"; return 1; }
+    if ! write_mihomo_pid_file "${pid}"; then
+      stop_mihomo_candidate "${pid}" "${launch_birth}" || print_err "无法确认候选 mihomo 已停止。"
+      return 1
+    fi
   fi
-
-  socks5_whitelist_apply || true
+  if [ "${MM_TEST_MODE:-0}" != 1 ]; then verify_data_plane_ready || { stop_service || true; return 1; }; fi
+  if [ "${MM_DEFER_WATCHDOG_ENABLE:-0}" != 1 ] && ! ensure_watchdog_enabled; then
+    stop_service || true
+    print_err "无法启用 watchdog，已回滚候选 mihomo。"
+    return 1
+  fi
   print_ok "服务状态：$(service_state)"
 }
 
+
+
 ensure_singbox_ready() {
-  init_storage
+  init_storage || return 1
   if [ ! -x "${MIHOMO_BIN}" ]; then
     print_info "检测到 mihomo 尚未安装，开始自动安装。"
-    install_core
+    install_core || return 1
   fi
   # F-05：systemd unit 缺失时补建（历史上 install 若中途失败/被清理会留下无 unit 状态，
   # rep/restart/update 等后续流程单独 start 即失败；这里幂等重建，存在则覆盖为同内容）。
   if systemd_available && [ ! -f "${SYSTEMD_SERVICE_FILE}" ]; then
     print_info "systemd unit 缺失，重建服务单元。"
-    create_systemd_units
+    create_systemd_units || return 1
   fi
   # F-06：OpenRC init 脚本缺失时同样补建。与 F-05 对称：当 mihomo/cloudflared
   # 已预置（如二进制旁路安装/install_core 未走）时，ensure_singbox_ready 不会触发
@@ -587,7 +965,7 @@ ensure_singbox_ready() {
   # "service does not exist" 令 rep/ins 整体回滚（Alpine/OpenRC 实测阻断）。
   if openrc_available && [ ! -f "${OPENRC_SERVICE_FILE}" ]; then
     print_info "OpenRC init 脚本缺失，重建服务单元。"
-    create_openrc_units
-    create_cron_watchdog
+    create_openrc_units || return 1
+    create_cron_watchdog || return 1
   fi
 }

@@ -53,8 +53,9 @@ esac
 export BASE_DIR="${TEST_ROOT}/etc"
 export LIB_DIR="${TEST_ROOT}/lib"
 export INSTALL_BIN="${TEST_ROOT}/mm"
-export PUBLIC_IP_CACHE="203.0.113.10"
+export PUBLIC_IP_CACHE="8.8.8.8"
 export MM_TEST_MODE=1
+export LOCK_ROOT="${TEST_ROOT}/locks" LOCK_FILE="${TEST_ROOT}/locks/smoke.lock"
 # MSYS 下禁用参数路径转换：沙箱路径已是 C:/ 风格无需转换，
 # 同时防止 -subj "/CN=..." 被误转换（Linux 上这些变量无效果）
 case "$(uname -s)" in
@@ -64,8 +65,48 @@ esac
 # shellcheck source=../mm.sh
 source "${ROOT_DIR}/mm.sh"
 
+# Validate every renderer call with the production argument contract.
+STUB_BIN="${TEST_ROOT}/bin"
+mkdir -p "${STUB_BIN}"
+cat >"${STUB_BIN}/mihomo" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+-v) echo "Mihomo Meta v1.19.31 linux amd64 with go1.26.8" ;;
+-d)
+  [ -n "${2:-}" ] && [ "${2:0:1}" = / ] || exit 2
+  shift 2
+  if [ "${1:-}" = -t ]; then
+    [ "${2:-}" = -f ] && [ -f "${3:-}" ] && [ "$#" -eq 3 ] || exit 2
+    exit 0
+  fi
+  [ "${1:-}" = -f ] && [ -f "${2:-}" ] && [ "$#" -eq 2 ] || exit 2
+  sleep 300
+  ;;
+-t)
+  # No validation without the same explicit data directory as production start.
+  exit 2 ;;
+run) exit 2 ;;
+generate)
+  shift
+  if [ "${1:-}" = "reality-keypair" ]; then
+    printf 'PrivateKey: %s\n' "$(openssl rand -base64 32 | tr -d '\n')"
+    printf 'PublicKey: %s\n' "$(openssl rand -base64 32 | tr -d '\n')"
+    exit 0
+  fi
+  if [ "${1:-}" = "uuid" ]; then
+    cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16
+    exit 0
+  fi
+  exit 1
+  ;;
+*) exit 2 ;;
+esac
+EOF
+chmod 0755 "${STUB_BIN}/mihomo"
+export MIHOMO_BIN="${STUB_BIN}/mihomo"
+
 # --- v1.2.5：订阅上报变化检测 / WS 自签 ---
-assert_eq "VERSION 稳定版 1.2.7" "v1.2.7" "$(tr -d "\r\n" < "${ROOT_DIR}/VERSION")"
+assert_eval_true "VERSION 合法且与 bootstrap PROJECT_VERSION 一致" 'v="$(tr -d "\r\n" < "${ROOT_DIR}/VERSION")"; [[ "${v}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && grep -qx "PROJECT_VERSION=\"${v}\"" "${ROOT_DIR}/install.sh"'
 assert_eval_true "UI WS 证书默认自签" 'grep -q '\''id="ws_cert_mode"'\'' "${ROOT_DIR}/interface/index.html" && grep -q '\''value="self" selected'\'' "${ROOT_DIR}/interface/index.html"'
 assert_eval_true "UI WS 自定义证书默认隐藏" 'grep -q '\''id="ws-custom-cert" style="display:none"'\'' "${ROOT_DIR}/interface/index.html"'
 assert_eval_true "UI WS 端口标明源站回源" 'grep -q "源站回源端口（TLS）" "${ROOT_DIR}/interface/index.html"'
@@ -139,10 +180,11 @@ assert_eval_false "is_private_ip 172.32段" 'is_private_ip 172.32.0.1'
 assert_eval_false "is_private_ip 公网" 'is_private_ip 8.8.8.8'
 assert_eq "wrap_host IPv6 加括号" "[::1]" "$(wrap_host "::1")"
 assert_eq "wrap_host IPv4 原样" "1.2.3.4" "$(wrap_host "1.2.3.4")"
-assert_eq "get_public_ip 使用缓存" "203.0.113.10" "$(get_public_ip)"
+assert_eq "get_public_ip 使用缓存" "8.8.8.8" "$(get_public_ip)"
 
 # --- 存储初始化与 JSON 读写 ---
 init_storage
+mkdir -p "$(mihomo_data_dir)"
 assert_eval_true "init_storage 建立目录" '[ -d "${CERT_DIR}" ] && [ -d "${RUNTIME_DIR}" ]'
 assert_eq "nodes.json 权限 600" "600" "$(stat -c %a "${NODES_FILE}")"
 
@@ -154,14 +196,15 @@ json_set_field "${NODES_FILE}" "n1" "endpoint_domain" "demo.example.com"
 assert_eq "json_set_field 写入字段" "demo.example.com" "$(node_value n1 endpoint_domain)"
 
 # --- node_meta 单次 jq 批量字段（性能优化：nodes+secrets 合并取 25 字段） ---
-assert_eq "node_meta 协议" "vless-reality" "$(node_meta n1 | sed -n '1p')"
-assert_eq "node_meta 端口" "443" "$(node_meta n1 | sed -n '3p')"
-assert_eq "node_meta uuid" "uuid-1111" "$(node_meta n1 | sed -n '4p')"
-assert_eq "node_meta private_key" "priv_test" "$(node_meta n1 | sed -n '6p')"
-assert_eq "node_meta public_key" "pbk_test" "$(node_meta n1 | sed -n '7p')"
-assert_eq "node_meta short_id" "abcd" "$(node_meta n1 | sed -n '8p')"
-assert_eq "node_meta 缺失字段补空行" "" "$(node_meta n1 | sed -n '9p')"
-assert_eq "node_meta 输出恰好 25 行" "25" "$(node_meta n1 | wc -l)"
+node_meta_array n1
+assert_eq "node_meta 协议" "vless-reality" "${NODE_META[0]}"
+assert_eq "node_meta 端口" "443" "${NODE_META[2]}"
+assert_eq "node_meta uuid" "uuid-1111" "${NODE_META[3]}"
+assert_eq "node_meta private_key" "priv_test" "${NODE_META[5]}"
+assert_eq "node_meta public_key" "pbk_test" "${NODE_META[6]}"
+assert_eq "node_meta short_id" "abcd" "${NODE_META[7]}"
+assert_eq "node_meta 缺失字段保持空值" "" "${NODE_META[8]}"
+assert_eq "node_meta 恰好 25 字段" "25" "${#NODE_META[@]}"
 
 # --- 端口占用快照（性能优化：每端口不再重复 jq/ss） ---
 assert_eval_true "metadata_has_port 命中节点端口" 'metadata_has_port 443'
@@ -198,8 +241,9 @@ json_delete_record "${SECRETS_FILE}" "nmulti"
 
 # 9.5：多源探测响应归一化（裸 IP / 文本 / JSON 字段）
 assert_eq "extract_public_ip 裸 IP 直通" "1.2.3.4" "$(extract_public_ip "  1.2.3.4  ")"
-assert_eq "extract_public_ip 文本含 IP" "203.0.113.9" "$(extract_public_ip "当前 IP：203.0.113.9 来自于：北京市 电信")"
-assert_eq "extract_public_ip JSON data 字段" "198.51.100.7" "$(extract_public_ip '{"ip":"198.51.100.7","detail":"x"}')"
+assert_eq "extract_public_ip 文本含 IP" "8.8.4.4" "$(extract_public_ip "当前 IP：8.8.4.4 来自于：公网")"
+assert_eq "extract_public_ip JSON data 字段" "1.1.1.1" "$(extract_public_ip '{"ip":"1.1.1.1","detail":"x"}')"
+assert_eval_false "extract_public_ip 拒绝保留地址" 'extract_public_ip "203.0.113.9"'
 assert_eval_false "extract_public_ip 无 IP 返回失败" 'extract_public_ip "no ip here"'
 
 # 1.2：clash_api 开关/端口/secret 持久化
@@ -218,7 +262,7 @@ assert_eval_true "clash_api e2e: 默认态 config 含 external-controller + secr
 
 # --- 分享链接 ---
 assert_eval_true "Reality 链接含 reality 参数" 'build_share_link n1 | grep -q "security=reality"'
-assert_eval_true "Reality 链接含缓存公网 IP" 'build_share_link n1 | grep -q "203.0.113.10:443"'
+assert_eval_true "Reality 链接含缓存公网 IP" 'build_share_link n1 | grep -q "8.8.8.8:443"'
 
 json_set_record "${NODES_FILE}" "n2" '{"protocol":"hy2","name":"Hysteria2","port":11443,"tls_server":"www.bing.com","certificate_mode":"self-signed"}'
 json_set_record "${SECRETS_FILE}" "n2" '{"password":"pw123"}'
@@ -270,6 +314,7 @@ json_set_record "${SECRETS_FILE}" "n3" '{"password":"pw456"}'
 assert_eval_true "socks5 链接含用户名密码" 'build_share_link n3 | grep -q "user:pw456@"'
 
 # --- 链接参数编码与域名校验（审查 F-09） ---
+assert_eq "批量 URI 编码保留以横杠开头的字段" $'a%26b.com\n%2Fp\n--arg-test' "$(url_encode_many 'a&b.com' /p --arg-test)"
 json_set_record "${NODES_FILE}" "n9" '{"protocol":"vless-ws-tls","name":"EN&X","port":443,"preferred_domain":"cdn.example.com","host_domain":"a&b.com","ws_path":"/p","certificate_mode":"custom"}'
 json_set_record "${SECRETS_FILE}" "n9" '{"uuid":"u9"}'
 assert_eval_true "特殊字符 host 被编码" 'build_share_link n9 | grep -q "sni=a%26b.com"'
@@ -297,7 +342,7 @@ assert_eval_true "域名 WS(CDN) authority 不受影响" 'build_share_link n6d |
 # WS-TLS 直连与 CDN 中转双模式（v0.2.22）：
 json_set_record "${NODES_FILE}" "nws-direct" '{"protocol":"vless-ws-tls","name":"WS-Direct","port":20835,"host_domain":"ws.example.com","ws_path":"/p","certificate_mode":"self-signed","ws_mode":"direct"}'
 json_set_record "${SECRETS_FILE}" "nws-direct" '{"uuid":"uwsd"}'
-assert_eval_true "WS 直连 authority 用服务器 IP" 'build_share_link nws-direct | grep -q "@203.0.113.10:20835"'
+assert_eval_true "WS 直连 authority 用服务器 IP" 'build_share_link nws-direct | grep -q "@8.8.8.8:20835"'
 assert_eval_true "WS 直连 sni/host 用 WS Host 域名" 'build_share_link nws-direct | grep -q "sni=ws.example.com&type=ws&host=ws.example.com"'
 assert_eval_true "WS 直连自签无证书时回退 allowInsecure=1" 'build_share_link nws-direct | grep -q "allowInsecure=1"'
 assert_eval_true "WS 直连 allowInsecure 在 query 段（位于 # 之前）" 'build_share_link nws-direct | grep -q "&allowInsecure=1#WS-Direct$"'
@@ -346,20 +391,33 @@ rm -f "${RUNTIME_DIR}/bad.pid" "${RUNTIME_DIR}/ws.pid"
 assert_eval_false "pid_matches_binary_or_alive 拒绝身份不符进程" 'pid_matches_binary_or_alive $$ /nonexistent/mm-other-binary'
 # 回归：in-place 升级后旧进程 /proc/PID/exe 带 " (deleted)" 后缀仍应判定为"我们的实例"
 # （否则 kill_pid_file 会跳过终止，导致旧进程残留与新实例并存）。
-if [ -d /proc ] && command -v sleep >/dev/null 2>&1; then
+# Native executable avoids renamed BusyBox/coreutils multicall dispatch.
+if [ -d /proc ] && _pb_cc="$(command -v cc)"; then
   _pb="${TEST_ROOT}/.pidbin"
-  cp /bin/sleep "${_pb}" 2>/dev/null || cp "$(dirname "$(command -v sleep)")/sleep" "${_pb}"
-  chmod +x "${_pb}"
-  "${_pb}" 30 &
+  cat >"${TEST_ROOT}/pidbin.c" <<'C'
+#include <unistd.h>
+int main(void) { sleep(30); return 0; }
+C
+  "$_pb_cc" -Wall -Wextra -Werror -O2 -o "$_pb" "${TEST_ROOT}/pidbin.c"
+  "$_pb" &
   _pb_pid=$!
-  sleep 0.2
-  rm -f "${_pb}"
-  # MSYS 下 /proc/PID/exe 与 Windows 风格路径无法对等模拟原地替换，仅 Linux 上断言 (deleted)
-  if [[ "$(readlink "/proc/${_pb_pid}/exe" 2>/dev/null || true)" == *" (deleted)"* ]]; then
-    assert_eval_true "pid_matches_binary 命中原地替换后的 (deleted) exe（兼容升级）" 'pid_matches_binary "'"${_pb_pid}"'" "'"${_pb}"'"'
-    assert_eval_true "pid_matches_binary_or_alive 对 (deleted) exe 判为存活（兼容升级）" 'pid_matches_binary_or_alive "'"${_pb_pid}"'" "'"${_pb}"'"'
+  _pb_ready=0
+  for _pb_attempt in {1..50}; do
+    if [ "$(readlink "/proc/${_pb_pid}/exe" 2>/dev/null || true)" = "$_pb" ]; then _pb_ready=1; break; fi
+    sleep 0.02
+  done
+  rm -f "$_pb"
+  if [ "$_pb_ready" = 1 ] && [[ "$(readlink "/proc/${_pb_pid}/exe" 2>/dev/null || true)" == *" (deleted)"* ]]; then
+    assert_eval_true "native deleted exe identity" 'pid_matches_binary "$_pb_pid" "$_pb"'
+    assert_eval_true "native deleted exe identity or alive" 'pid_matches_binary_or_alive "$_pb_pid" "$_pb"'
+  else
+    FAIL=$((FAIL + 2))
+    printf 'FAIL: native deleted executable not observable (2 assertions)\n' >&2
   fi
-  kill "${_pb_pid}" 2>/dev/null || true
+  kill "$_pb_pid" 2>/dev/null || true
+  wait "$_pb_pid" 2>/dev/null || true
+else
+  printf 'SKIP2: deleted-executable assertions require cc and Linux /proc\n'
 fi
 
 # --- 自签证书与回退逻辑 ---
@@ -381,7 +439,7 @@ assert_eval_true "cert_fingerprint 缓存命中幂等" '
   )"
   [ "${out}" -ge 1 ]'
 assert_eval_true "auto_cert_bundle 默认自签" 'auto_cert_bundle t_auto www.bing.com | grep -q "^self-signed|"'
-assert_eval_false "auto_cert_bundle custom 缺路径回退自签" 'unset cert_path key_path; cert=custom; auto_cert_bundle t_c www.bing.com | grep -q "^custom|"'
+assert_eval_false "auto_cert_bundle custom 缺路径拒绝" '( unset cert_path key_path; cert=custom; auto_cert_bundle t_c www.bing.com )'
 # 回归：cert_path/key_path 环境变量不再被局部变量遮蔽
 cpair="$(ensure_tls_material certsrc www.bing.com)"
 export cert=custom
@@ -394,7 +452,7 @@ unset cert cert_path key_path
 b64pair="$(ensure_tls_material certb64 www.bing.com)"
 assert_eval_true "cert_b64/key_b64 内容导入为 custom" 'export cert=custom cert_b64="$(base64 -w0 <"${b64pair%|*}")" key_b64="$(base64 -w0 <"${b64pair#*|}")"; auto_cert_bundle ctest3 www.bing.com | grep -q "^custom|"'
 unset cert cert_b64 key_b64
-assert_eval_false "cert_b64 缺 key_b64 回退自签" 'export cert=custom cert_b64="QUJD"; unset key_b64; auto_cert_bundle t_b64miss www.bing.com | grep -q "^custom|"'
+assert_eval_false "cert_b64 缺 key_b64 拒绝" '( export cert=custom cert_b64="QUJD"; unset key_b64; auto_cert_bundle t_b64miss www.bing.com )'
 unset cert cert_b64
 
 # --- 状态备份与恢复（含证书，审查 F-02/F-09） ---
@@ -404,7 +462,7 @@ json_set_record "${SECRETS_FILE}" "bk" '{"password":"p"}'
 mkdir -p "${CERT_DIR}" && printf 'CERT' >"${CERT_DIR}/bk.crt" && printf 'KEY' >"${CERT_DIR}/bk.key"
 # shellcheck disable=SC2034 # 结果在下方 assert_eval_true 的 eval 字符串内消费
 bkp_dir="$(backup_state)"
-assert_eval_true "备份目录名唯一（随机+进程后缀, 审查 F-09）" '[[ "${bkp_dir}" =~ [0-9]{4}-[0-9]+$ ]]'
+assert_eval_true "备份目录名唯一（进程+随机后缀, 审查 F-09）" '[[ "${bkp_dir}" =~ [0-9]{8}-[0-9]{6}-[0-9]+-[A-Za-z0-9]+$ ]]'
 assert_eval_true "备份含证书文件（审查 F-02）" '[ -f "${bkp_dir}/certs/bk.crt" ] && [ -f "${bkp_dir}/certs/bk.key" ]'
 wipe_records
 assert_eq "清空后节点为 0" "0" "$(jq length "${NODES_FILE}")"
@@ -438,8 +496,8 @@ assert_eq "wipe_records 清空 secrets" "0" "$(jq length "${SECRETS_FILE}")"
 
 # --- 日志轮转 ---
 big_file="${TEST_ROOT}/big.log"
-head -c 2048 /dev/zero >>"${big_file}"
-LOG_ROTATE_SIZE_MB=0 rotate_log_file "${big_file}" || true
+head -c 1048576 /dev/zero >>"${big_file}"
+LOG_ROTATE_SIZE_MB=1 rotate_log_file "${big_file}"
 assert_eval_true "rotate_log_file 产生轮转文件" '[ -f "${big_file}.1" ]'
 
 # --- v0.2.17：GOMEMLIMIT 计算 / DoH 域名确认 / 多源下载 ---
@@ -478,41 +536,57 @@ json_set_record "${SECRETS_FILE}" "nargo-cdn" '{"uuid":"uac"}'
 assert_eval_true "Argo 链接使用 argo_cdn_port" 'build_share_link nargo-cdn | grep -q "@argo.example.com:2053"'
 assert_eval_false "Argo 链接不再硬编码 443" 'build_share_link nargo-cdn | grep -q "443?encryption"'
 
+# TLS renderer fixtures use one real managed certificate/key pair.
+_smoke_pair="$(ensure_tls_material fixture www.bing.com)"
+SMOKE_TLS_CERT="${_smoke_pair%%|*}"
+SMOKE_TLS_KEY="${_smoke_pair#*|}"
 # --- v0.3.0：CDN 模式 cdn_sni 编号或回退连接地址链接生成（审查 ws_cdn 设计） ---
 json_set_record "${NODES_FILE}" "nws-cdn2" '{"protocol":"vless-ws-tls","name":"WS-CDN2","port":20835,"preferred_domain":"cdn.example.com","host_domain":"ws.example.com","ws_path":"/p","certificate_mode":"custom","ws_mode":"cdn","cdn_port":8443,"cdn_sni":"origin.example.com"}'
+json_set_field "${NODES_FILE}" "nws-cdn2" certificate_path "${SMOKE_TLS_CERT}"
+json_set_field "${NODES_FILE}" "nws-cdn2" key_path "${SMOKE_TLS_KEY}"
 json_set_record "${SECRETS_FILE}" "nws-cdn2" '{"uuid":"uwsc2"}'
 assert_eval_true "WS CDN 连接地址用优选域名、SNI/Host 用 cdn_sni" 'build_share_link nws-cdn2 | grep -q "@cdn.example.com:8443?encryption=none&security=tls&sni=origin.example.com&type=ws&host=origin.example.com"'
 json_set_record "${NODES_FILE}" "nws-cdn0" '{"protocol":"vless-ws-tls","name":"WS-CDN0","port":20835,"preferred_domain":"cdn.example.com","host_domain":"ws.example.com","ws_path":"/p","certificate_mode":"custom","ws_mode":"cdn","cdn_port":8443}'
+json_set_field "${NODES_FILE}" "nws-cdn0" certificate_path "${SMOKE_TLS_CERT}"
+json_set_field "${NODES_FILE}" "nws-cdn0" key_path "${SMOKE_TLS_KEY}"
 json_set_record "${SECRETS_FILE}" "nws-cdn0" '{"uuid":"uwsc0"}'
 assert_eval_true "WS CDN 无 cdn_sni 时回退连接地址" 'build_share_link nws-cdn0 | grep -q "sni=cdn.example.com&type=ws&host=cdn.example.com"'
 
 # --- v1.1.0：性能/稳定性（TCP Fast Open / HY2 不限速 / GOGC / 退避 / 探活） ---
 json_set_record "${NODES_FILE}" "nhyu" '{"protocol":"hy2","name":"HY2-UNLIM","port":11445,"tls_server":"www.bing.com","certificate_mode":"self-signed"}'
+json_set_field "${NODES_FILE}" "nhyu" certificate_path "${SMOKE_TLS_CERT}"
+json_set_field "${NODES_FILE}" "nhyu" key_path "${SMOKE_TLS_KEY}"
 json_set_record "${SECRETS_FILE}" "nhyu" '{"password":"pw"}'
 json_set_record "${NODES_FILE}" "nws-tune" '{"protocol":"vless-ws-tls","name":"WS-Tune","port":20840,"preferred_domain":"cdn.example.com","host_domain":"ws.example.com","ws_path":"/e","certificate_mode":"custom","certificate_path":"cert"}'
+json_set_field "${NODES_FILE}" "nws-tune" certificate_path "${SMOKE_TLS_CERT}"
+json_set_field "${NODES_FILE}" "nws-tune" key_path "${SMOKE_TLS_KEY}"
 json_set_record "${SECRETS_FILE}" "nws-tune" '{"uuid":"ut"}'
 
 # mihomo：渲染单 listener 直接校验（写 stdout，不依赖 CONFIG_FILE）
 tmpcfg="$(mktemp "${TEST_ROOT}/cfg.XXXXXX")"
 render_inbound_for_tag nws-tune >"${tmpcfg}" 2>/dev/null
-assert_eval_true "WS-TLS listener type/ws-path/证书" 'grep -qE "type: vless$" "${tmpcfg}" && grep -qE "ws-path: .*/e" "${tmpcfg}" && grep -qE "certificate: .cert." "${tmpcfg}"'
+assert_eval_true "WS-TLS listener type/ws-path/证书" 'grep -qE "type: vless$" "${tmpcfg}" && grep -qE "ws-path: .*/e" "${tmpcfg}" && grep -qE "certificate: .*fixture.crt." "${tmpcfg}"'
 rm -f "${tmpcfg}"
 
 # P1：HY2 无 up/down 字段 -> 渲染时回退默认 200 Mbps
 tmpcfg="$(mktemp "${TEST_ROOT}/cfg.XXXXXX")"
 render_inbound_for_tag nhyu >"${tmpcfg}" 2>/dev/null
-assert_eval_true "HY2 未设置带宽时写默认 200 Mbps" 'grep -qE "up: 200 Mbps" "${tmpcfg}" && grep -qE "down: 200 Mbps" "${tmpcfg}"'
+assert_eval_true "HY2 未设置带宽时写默认 200 Mbps" 'grep -qE "up: .?200 Mbps" "${tmpcfg}" && grep -qE "down: .?200 Mbps" "${tmpcfg}"'
 rm -f "${tmpcfg}"
 
 # P1：填写带宽时仍正确写入
 json_set_record "${NODES_FILE}" "nhyu" '{"protocol":"hy2","name":"HY2-UNLIM","port":11445,"tls_server":"www.bing.com","certificate_mode":"self-signed","up_mbps":400,"down_mbps":800}'
+json_set_field "${NODES_FILE}" "nhyu" certificate_path "${SMOKE_TLS_CERT}"
+json_set_field "${NODES_FILE}" "nhyu" key_path "${SMOKE_TLS_KEY}"
 tmpcfg="$(mktemp "${TEST_ROOT}/cfg.XXXXXX")"
 render_inbound_for_tag nhyu >"${tmpcfg}" 2>/dev/null
-assert_eval_true "HY2 限速时写 400/800 Mbps" 'grep -qE "up: 400 Mbps" "${tmpcfg}" && grep -qE "down: 800 Mbps" "${tmpcfg}"'
+assert_eval_true "HY2 限速时写 400/800 Mbps" 'grep -qE "up: .?400 Mbps" "${tmpcfg}" && grep -qE "down: .?800 Mbps" "${tmpcfg}"'
 rm -f "${tmpcfg}"
 
 # --- B1：TUIC 使用 bbr 拥塞控制 + alpn h3，users 为 uuid:password map ---
 json_set_record "${NODES_FILE}" "ntic" '{"protocol":"tuic-v5","name":"TUIC-ZRTT","port":10111,"tls_server":"www.bing.com","certificate_mode":"self-signed"}'
+json_set_field "${NODES_FILE}" "ntic" certificate_path "${SMOKE_TLS_CERT}"
+json_set_field "${NODES_FILE}" "ntic" key_path "${SMOKE_TLS_KEY}"
 json_set_record "${SECRETS_FILE}" "ntic" '{"uuid":"uz","password":"pz"}'
 tmpcfg="$(mktemp "${TEST_ROOT}/cfg.XXXXXX")"
 render_inbound_for_tag ntic >"${tmpcfg}" 2>/dev/null
@@ -570,6 +644,8 @@ assert_eval_true "A2 串行回退：存活端口返回真" '
 # v1.2.4：CDN 模式采用 CF 证书方案（Full/Full-Strict 回源）——源站仅渲染 TLS WS inbound（wspt 统一单端口），
 # 旧 ws_cdn_origin_port（明文 HTTP 回源）已废弃：即使节点记录里残留该字段也忽略，不再追加明文 inbound。
 json_set_record "${NODES_FILE}" "nws-cdnextra" '{"protocol":"vless-ws-tls","name":"WS-CDNX","port":20844,"preferred_domain":"cdn.example.com","host_domain":"ws.example.com","ws_path":"/x","certificate_mode":"custom","ws_mode":"cdn","cdn_port":443,"ws_cdn_origin_port":80}'
+json_set_field "${NODES_FILE}" "nws-cdnextra" certificate_path "${SMOKE_TLS_CERT}"
+json_set_field "${NODES_FILE}" "nws-cdnextra" key_path "${SMOKE_TLS_KEY}"
 json_set_record "${SECRETS_FILE}" "nws-cdnextra" '{"uuid":"ux"}'
 tmpcfg="$(mktemp "${TEST_ROOT}/cfg.XXXXXX")"
 render_inbound_for_tag nws-cdnextra >"${tmpcfg}" 2>/dev/null
@@ -579,6 +655,8 @@ rm -f "${tmpcfg}"
 
 # v1.2.4：CDN 仅 TLS inbound 时不产生端口冲突问题（单端口即 wspt 本身）
 json_set_record "${NODES_FILE}" "nws-cdnconflict" '{"protocol":"vless-ws-tls","name":"WS-CDC","port":20845,"preferred_domain":"cdn.example.com","host_domain":"ws.example.com","ws_path":"/c","certificate_mode":"custom","ws_mode":"cdn","cdn_port":443,"ws_cdn_origin_port":20845}'
+json_set_field "${NODES_FILE}" "nws-cdnconflict" certificate_path "${SMOKE_TLS_CERT}"
+json_set_field "${NODES_FILE}" "nws-cdnconflict" key_path "${SMOKE_TLS_KEY}"
 json_set_record "${SECRETS_FILE}" "nws-cdnconflict" '{"uuid":"uc"}'
 tmpcfg="$(mktemp "${TEST_ROOT}/cfg.XXXXXX")"
 render_inbound_for_tag nws-cdnconflict >"${tmpcfg}" 2>/dev/null
@@ -587,6 +665,8 @@ rm -f "${tmpcfg}"
 
 # v1.2.4：direct 模式不渲染 CDN 相关端口（回归，防直连被误加端口）
 json_set_record "${NODES_FILE}" "nws-direct2" '{"protocol":"vless-ws-tls","name":"WS-DIR","port":20846,"preferred_domain":"cdn.example.com","host_domain":"ws.example.com","ws_path":"/d","certificate_mode":"custom","tcp_fast_open":true}'
+json_set_field "${NODES_FILE}" "nws-direct2" certificate_path "${SMOKE_TLS_CERT}"
+json_set_field "${NODES_FILE}" "nws-direct2" key_path "${SMOKE_TLS_KEY}"
 json_set_record "${SECRETS_FILE}" "nws-direct2" '{"uuid":"ud"}'
 tmpcfg="$(mktemp "${TEST_ROOT}/cfg.XXXXXX")"
 render_inbound_for_tag nws-direct2 >"${tmpcfg}" 2>/dev/null
@@ -618,23 +698,37 @@ assert_eval_false "P2 tcp_probeable_protocol 未知" 'tcp_probeable_protocol unk
 
 # P3：就绪自检核心 await_tcp_ports（python3 起真实监听；缺失则跳过）
 if command_exists python3; then
-  python3 - <<'PY' &
+  python3 - "$TEST_ROOT/p3-ports" <<'PY' &
 import socket, time, sys
 socks = []
-for port in (65124, 65125):
+for index in range(3):
     s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("127.0.0.1", port))
-    s.listen(1)
+    s.bind(("127.0.0.1", 0))
+    if index < 2:
+        s.listen(128)
     socks.append(s)
-time.sleep(30)
+with open(sys.argv[1], "w") as ready:
+    ready.write(" ".join(str(s.getsockname()[1]) for s in socks) + "\n")
+time.sleep(45)
 PY
   _lp=$!
-  sleep 1
-  assert_eval_true "P3 await_tcp_ports 监听中返回 0" 'await_tcp_ports 127.0.0.1 "65124 65125" 2'
-  assert_eval_false "P3 await_tcp_ports 未监听端口返回 1" 'await_tcp_ports 127.0.0.1 "65126" 1'
+  for _lp_attempt in {1..200}; do
+    [ -s "$TEST_ROOT/p3-ports" ] && break
+    kill -0 "$_lp" 2>/dev/null || break
+    sleep 0.05
+  done
+  if [ ! -s "$TEST_ROOT/p3-ports" ]; then
+    kill "$_lp" 2>/dev/null || true
+    wait "$_lp" 2>/dev/null || true
+    printf 'FAIL: P3 loopback fixture did not become ready\n' >&2
+    exit 1
+  fi
+  read -r _lp_first _lp_second _lp_closed <"$TEST_ROOT/p3-ports"
+  assert_eval_true "P3 await_tcp_ports 监听中返回 0" 'await_tcp_ports 127.0.0.1 "$_lp_first $_lp_second" 2'
+  assert_eval_false "P3 await_tcp_ports 未监听端口返回 1" 'await_tcp_ports 127.0.0.1 "$_lp_closed" 1'
   assert_eval_true "P3 await_tcp_ports 空端口列表返回 0" 'await_tcp_ports 127.0.0.1 "" 1'
-  kill "${_lp}" 2>/dev/null || true
+  kill "$_lp" 2>/dev/null || true
+  wait "$_lp" 2>/dev/null || true
 else
   printf '[提示] 无 python3，跳过 P3 监听探活断言\n' >&2
 fi
@@ -646,24 +740,29 @@ assert_eval_true "net_tune 默认启用" 'net_tune_requested'
 assert_eval_false "net_tune=0 关闭" '( net_tune=0; net_tune_requested )'
 assert_eval_true "net_tune=1 启用" '( net_tune=1; net_tune_requested )'
 assert_eval_true "TCP buffer 内存上限为 16/32/64 之一" 'case $(get_tcp_buffer_cap_mb) in 16|32|64) true;; *) false;; esac'
-assert_eq "asia 低带宽 buffer=8" "8" "$(calculate_net_tune_buffer_mb 100 asia)"
-assert_eq "asia 1G buffer=16" "16" "$(calculate_net_tune_buffer_mb 1000 asia)"
-assert_eq "asia 2G buffer=24" "24" "$(calculate_net_tune_buffer_mb 2000 asia)"
-assert_eq "asia 5G buffer=28" "28" "$(calculate_net_tune_buffer_mb 5000 asia)"
-assert_eq "asia 千兆以上 buffer=32" "32" "$(calculate_net_tune_buffer_mb 10000 asia)"
-assert_eq "asia 下限边界 999Mbps" "12" "$(calculate_net_tune_buffer_mb 999 asia)"
-assert_eq "overseas 低带宽 buffer=16" "16" "$(calculate_net_tune_buffer_mb 300 overseas)"
-assert_eq "overseas 1G buffer=64" "64" "$(calculate_net_tune_buffer_mb 1000 overseas)"
-assert_eq "overseas 下限边界 999Mbps" "48" "$(calculate_net_tune_buffer_mb 999 overseas)"
-assert_eq "算档位 空带宽回退 1000Mbps" "16" "$(calculate_net_tune_buffer_mb "" asia)"
+# Fixture-only cap for raw bandwidth mappings; real cap assertions remain unchanged.
+calculate_unclamped_fixture() (
+  get_tcp_buffer_cap_mb() { printf '%s' 64; }
+  calculate_net_tune_buffer_mb "$@"
+)
+assert_eq "asia 低带宽 buffer=8" "8" "$(calculate_unclamped_fixture 100 asia)"
+assert_eq "asia 1G buffer=16" "16" "$(calculate_unclamped_fixture 1000 asia)"
+assert_eq "asia 2G buffer=24" "24" "$(calculate_unclamped_fixture 2000 asia)"
+assert_eq "asia 5G buffer=28" "28" "$(calculate_unclamped_fixture 5000 asia)"
+assert_eq "asia 千兆以上 buffer=32" "32" "$(calculate_unclamped_fixture 10000 asia)"
+assert_eq "asia 下限边界 999Mbps" "12" "$(calculate_unclamped_fixture 999 asia)"
+assert_eq "overseas 低带宽 buffer=16" "16" "$(calculate_unclamped_fixture 300 overseas)"
+assert_eq "overseas 1G buffer=64" "64" "$(calculate_unclamped_fixture 1000 overseas)"
+assert_eq "overseas 下限边界 999Mbps" "48" "$(calculate_unclamped_fixture 999 overseas)"
+assert_eq "算档位 空带宽回退 1000Mbps" "16" "$(calculate_unclamped_fixture "" asia)"
 assert_eval_true "buffer 受内存上限约束" '( B=$(calculate_net_tune_buffer_mb 10000 overseas); [ "$B" -le "$(get_tcp_buffer_cap_mb)" ] )'
 mkdir -p "${TEST_ROOT}/speedtest"
 cat >"${TEST_ROOT}/speedtest/speedtest" <<'EOF'
 #!/usr/bin/env bash
-# v1.5.6：支持 -j/--output-type=json 的版本输出结构化 JSON，否则回退人类文本
+# v1.5.6：支持 -j/--format=json 的版本输出结构化 JSON，否则回退人类文本
 case " $* " in
-*" --output-type=json "*)
-  printf '%s\n' '{"type":"result","ping":{"jitter":1.5,"latency":12.34,"low":11,"high":13},"download":{"bandwidth":812340000,"bytes":101542500,"elapsed":1000},"upload":{"bandwidth":300780000,"bytes":37597500,"elapsed":1000}}'
+*" --format=json "*)
+  printf '%s\n' '{"type":"result","ping":{"jitter":1.5,"latency":12.34,"low":11,"high":13},"download":{"bandwidth":812340000,"bytes":101542500,"elapsed":1000},"upload":{"bandwidth":37597500,"bytes":37597500,"elapsed":1000}}'
   ;;
 *)
   printf '%s\n' "   Speedtest by Ookla 1.2.0"
@@ -685,17 +784,17 @@ EOF
   cd "${TEST_ROOT}/speedtest"
   chmod +x speedtest speedtest-text
 )
-# 9.1：JSON 输出优先解析（bandwidth bit/s ÷ 1e6 = Mbps；latency ms 取整）
+# 9.1：JSON 输出优先解析（bandwidth bytes/s × 8 ÷ 1e6 = Mbps；latency ms 取整）
 assert_eq "Ookla 测速输出解析 Upload" "300" "$(run_speedtest "${TEST_ROOT}/speedtest/speedtest")"
 assert_eq "Ookla 测速输出解析 带宽+延迟" "300 12" "$(run_speedtest_metrics "${TEST_ROOT}/speedtest/speedtest")"
-# 9.1：无 JSON 输出的老版本走人类文本回退
+# 9.1：同一次成功调用的文本输出可解析；失败调用不可触发第二次测速
 assert_eq "Ookla 无JSON 回退文本 Upload" "200" "$(run_speedtest "${TEST_ROOT}/speedtest/speedtest-text")"
 assert_eq "Ookla 无JSON 回退文本 带宽+延迟" "200 21" "$(run_speedtest_metrics "${TEST_ROOT}/speedtest/speedtest-text")"
 assert_eval_true "Ookla 官方 speedtest 识别" 'ls -la "${TEST_ROOT}/speedtest/speedtest" >/dev/null'
 
 # v1.2.3：net_tune 交互确认在非交互环境原样返回（保在线脚本可无人值守）
 assert_eq "确认环节 非交互原样返回" "300 12" "$(NET_TUNE_SKIP_CONFIRM=1 net_tune_confirm_measurement 300 12 asia)"
-assert_eval_true "确认环节 stdin非TTY 原样返回" 'echo "" | net_tune_confirm_measurement 500 20 asia | grep -q "^500 20"'
+assert_eq "确认环节 stdin非TTY 原样返回" "500 20" "$(net_tune_confirm_measurement 500 20 asia </dev/null)"
 assert_eq "延迟推断档位 <150ms→asia" "asia" "$(infer_net_tune_region 80)"
 assert_eq "延迟推断档位 >=150ms→overseas" "overseas" "$(infer_net_tune_region 200)"
 assert_eq "延迟推断档位 空→asia" "asia" "$(infer_net_tune_region "")"
@@ -707,32 +806,7 @@ assert_eq "端到端前置清空" "0" "$(jq length "${NODES_FILE}")"
 # ---------------------------------------------------------------------------
 # 一键安装（auto_install）端到端模拟：stub mihomo 二进制，覆盖 6 种协议
 # ---------------------------------------------------------------------------
-STUB_BIN="${TEST_ROOT}/bin"
-mkdir -p "${STUB_BIN}"
-cat >"${STUB_BIN}/mihomo" <<'EOF'
-#!/usr/bin/env bash
-case "${1:-}" in
--v) echo "Mihomo Meta v1.19.31 linux amd64 with go1.26.8" ;;
--t) exit 0 ;;
-run) sleep 300 ;;
-generate)
-  shift
-  if [ "${1:-}" = "reality-keypair" ]; then
-    printf 'PrivateKey: %s\n' "$(openssl rand -base64 32 | tr -d '\n')"
-    printf 'PublicKey: %s\n' "$(openssl rand -base64 32 | tr -d '\n')"
-    exit 0
-  fi
-  if [ "${1:-}" = "uuid" ]; then
-    cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16
-    exit 0
-  fi
-  exit 1
-  ;;
-*) exit 0 ;;
-esac
-EOF
-chmod 0755 "${STUB_BIN}/mihomo"
-export MIHOMO_BIN="${STUB_BIN}/mihomo"
+# Strict Mihomo fixture is created before the first render above.
 
 # XUDP Reality 独立回归：不改变下方 6 协议 auto_install 基线
 export vxpt=20837 vx_sni=www.bing.com
@@ -746,6 +820,14 @@ assert_eval_false "XUDP listener 不带 flow" 'grep -A8 "name: .*XUDP" "${CONFIG
 assert_eval_true "XUDP 分享链接含 packetEncoding" "build_share_link '${_xudp_tag}' | grep -q 'security=reality.*packetEncoding=xudp'"
 unset vxpt
 wipe_records
+# Host service managers and firewall state are exercised in audit-service.sh.
+# This suite checks node orchestration with a deterministic lifecycle boundary.
+ensure_singbox_ready() { init_storage; }
+start_service() { mihomo_validate "${CONFIG_FILE}" >/dev/null; }
+stop_service() { return 0; }
+reload_service() { start_service; }
+stop_all_argo_nodes() { return 0; }
+
 export vlrt=20831 wspt=20835 anypt=20834 tupt=20833 hypt=20832 socks5pt=20836
 export name=HK uuid=11111111-2222-3333-4444-555555555555 passwd=testpw
 export cdn_host=cdn.example.com ws_host=ws.example.com ws_path=/wspath
@@ -759,7 +841,7 @@ assert_eq "config 生成 6 个 listener" "6" "$(grep -cE '^  - type:' "${CONFIG_
 assert_eq "P2 一键安装 6 节点中 TCP 可探活数" "4" "$(tcp_probeable_node_count)"
 assert_eval_true "Reality listener 正确" 'grep -qE "reality-config:" "${CONFIG_FILE}" && grep -qE "private-key:" "${CONFIG_FILE}"'
 assert_eval_true "TUIC listener 正确" 'grep -qE "type: tuic" "${CONFIG_FILE}"'
-assert_eval_true "HY2 listener 带宽生效" 'grep -qE "up: 100 Mbps" "${CONFIG_FILE}"'
+assert_eval_true "HY2 listener 带宽生效" 'grep -qE "up: .?100 Mbps" "${CONFIG_FILE}"'
 assert_eval_true "WS listener 路径生效" 'grep -qE "ws-path: .*/wspath" "${CONFIG_FILE}"'
 assert_eval_true "SOCKS5 listener 用户生效" 'grep -qE "username: .u1." "${CONFIG_FILE}"'
 assert_eval_true "vless 使用指定 uuid" 'grep -qE "uuid: .11111111-2222-3333-4444-555555555555." "${CONFIG_FILE}"'
@@ -768,7 +850,7 @@ assert_eq "config 日志级别默认 warning" "warning" "$(grep -oE '^log-level:
 assert_eval_true "mode 为 direct" 'grep -qE "^mode: direct$" "${CONFIG_FILE}"'
 assert_eval_true "clash_api 可观测面默认开启(127.0.0.1)" 'grep -qE "^external-controller: .127.0.0.1:" "${CONFIG_FILE}"'
 assert_eval_true "general 块含 tcp-keep-alive-idle" 'grep -qE "^tcp-keep-alive-idle: 120$" "${CONFIG_FILE}"'
-assert_eval_true "HY2 限速 100/300 写入" 'grep -qE "up: 100 Mbps" "${CONFIG_FILE}" && grep -qE "down: 300 Mbps" "${CONFIG_FILE}"'
+assert_eval_true "HY2 限速 100/300 写入" 'grep -qE "up: .?100 Mbps" "${CONFIG_FILE}" && grep -qE "down: .?300 Mbps" "${CONFIG_FILE}"'
 assert_eval_true "TUIC 使用 bbr" 'grep -qE "congestion-controller: bbr" "${CONFIG_FILE}"'
 assert_eval_true "socks listener users 为 list" 'grep -qE "type: socks" "${CONFIG_FILE}" && grep -qE "username: .u1." "${CONFIG_FILE}" && grep -qE "password: .p1." "${CONFIG_FILE}"'
 # stub 进程存活仅对"纯进程托管"环境有意义：systemd/openrc 下 mihomo 由系统管理器
@@ -810,7 +892,7 @@ if ! systemd_available && ! openrc_available; then
     _p3="$(read_pid_file "${PID_FILE}" 2>/dev/null || true)"
     [ -n "${_p3}" ] && kill -0 "${_p3}" 2>/dev/null
   '
-  kill_pid_file "${PID_FILE}" || true
+  kill_pid_file "${PID_FILE}" "${MIHOMO_BIN}" || true
 else
   printf '[提示] systemd/openrc 托管环境：跳过 P1 热重载进程断言\n' >&2
 fi
@@ -837,7 +919,8 @@ assert_eq "sub_mode 默认 temp" "temp" "$(unset -v sub_mode; sub_mode)"
 assert_eq "sub_mode worker" "worker" "$(sub_mode=worker; sub_mode)"
 assert_eq "sub_worker_base 补 https" "https://sub.example.com" "$(sub_domain=sub.example.com; sub_worker_base)"
 assert_eq "sub_worker_base 去尾斜杠" "https://sub.example.com" "$(sub_domain=https://sub.example.com/; sub_worker_base)"
-assert_eq "sub_machine 规范化" "my-node" "$(sub_machine='My Node!'; sub_machine)"
+assert_eq "sub_machine 合法 slug" "my-node" "$(sub_machine=my-node; sub_machine)"
+assert_eval_false "sub_machine 拒绝非法 slug" 'sub_machine="My Node!" sub_machine'
 
 # 重复 ins：端口已被现有节点占用，全部跳过 → added=0 退出码 1（子 shell 中运行以捕获 exit）
 assert_eval_false "重复 ins 端口冲突时拒绝" '( auto_install ins )'
@@ -864,7 +947,7 @@ assert_eq "delall 后无残留证书" "0" "$(find "${CERT_DIR}" -type f | wc -l)
 assert_eq "P2 空节点后探活态为不适用(2)" "2" "$(singbox_probe_status 2>/dev/null && printf '0' || printf '%s' "$?")"
 
 # 清理 stub 进程
-kill_pid_file "${PID_FILE}" || true
+kill_pid_file "${PID_FILE}" "${MIHOMO_BIN}" || true
 
 # --- MTProxy 独立脚本（mtp.sh）纯函数验证 ---
 # shellcheck source=../mtp.sh
@@ -891,10 +974,10 @@ assert_eval_false "env_port 非法拒绝" 'env_port 0x1F'
 assert_eq "mtp_tg_secret 全零密钥 apple.com" "7gAAAAAAAAAAAAAAAAAAAABhcHBsZS5jb20" "$(mtp_tg_secret "00000000000000000000000000000000" "apple.com")"
 
 # mtp_run_args：IP_MODE 决定监听地址（v4/v6/dual），安装与无服务管理器重启共用
-assert_eq "mtp_run_args v4 模式" "simple-run -n 1.1.1.1 -t 30s -a 1mb -c 65535 -i only-ipv4 0.0.0.0:20086 eeabcd" "$(mtp_run_args 20086 eeabcd v4)"
-assert_eq "mtp_run_args v6 模式" "simple-run -n 1.1.1.1 -t 30s -a 1mb -c 65535 -i only-ipv6 [::]:20086 eeabcd" "$(mtp_run_args 20086 eeabcd v6)"
-assert_eq "mtp_run_args dual 模式" "simple-run -n 1.1.1.1 -t 30s -a 1mb -c 65535 -i prefer-ipv6 [::]:20086 eeabcd" "$(mtp_run_args 20086 eeabcd dual)"
-assert_eval_true "mtp_run_args 空模式回退 v4" 'mtp_run_args 20086 eeabcd | grep -q "only-ipv4 0.0.0.0:20086"'
+assert_eq "mtp_run_args v4 模式" "simple-run -n 1.1.1.1 -t 30s -a 1mb -c 65535 -i only-ipv4 0.0.0.0:20086 ee000000000000000000000000000000006170706c652e636f6d" "$(mtp_run_args 20086 ee000000000000000000000000000000006170706c652e636f6d v4)"
+assert_eq "mtp_run_args v6 模式" "simple-run -n 1.1.1.1 -t 30s -a 1mb -c 65535 -i only-ipv6 [::]:20086 ee000000000000000000000000000000006170706c652e636f6d" "$(mtp_run_args 20086 ee000000000000000000000000000000006170706c652e636f6d v6)"
+assert_eq "mtp_run_args dual 模式" "simple-run -n 1.1.1.1 -t 30s -a 1mb -c 65535 -i prefer-ipv6 [::]:20086 ee000000000000000000000000000000006170706c652e636f6d" "$(mtp_run_args 20086 ee000000000000000000000000000000006170706c652e636f6d dual)"
+assert_eval_true "mtp_run_args 空模式回退 v4" 'mtp_run_args 20086 ee000000000000000000000000000000006170706c652e636f6d | grep -q "only-ipv4 0.0.0.0:20086"'
 
 # 生成的 tg 链接可解码回原文：0xee + secret(16字节) + domain ascii
 assert_eval_true "mtp_tg_secret 可解码回原文" 's="$(mtp_tg_secret "cafebabecafebabecafebabecafebabe" "www.apple.com")"; p="$(printf %s "$s" | sed "s/-/+/g;s/_/\//g")"; while [ $(( ${#p} % 4 )) -ne 0 ]; do p="$p="; done; h="$(printf %s "$p" | base64 -d 2>/dev/null | od -A n -t x1 | tr -d " \n")"; [[ "$h" == "eecafebabecafebabecafebabecafebabe7777772e6170706c652e636f6d" ]]'

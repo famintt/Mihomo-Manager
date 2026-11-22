@@ -77,15 +77,7 @@ main() {
     ;;
   restore)
     require_root
-    init_storage
-    acquire_lock
-    if restore_latest_backup; then
-      reconcile_state || true
-      render_config
-      start_service
-      print_ok "已恢复并重启服务。"
-    fi
-    release_lock
+    restore_stack
     ;;
   un)
     require_root

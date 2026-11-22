@@ -3,81 +3,99 @@ set -eEuo pipefail
 
 umask 077
 
-rollback_new_node() {
-  local tag="$1"
-  local cert_file="${2:-}"
-  local key_file="${3:-}"
-  delete_node_records "$tag" || true
-  remove_node_certificates "$tag" "$cert_file" "$key_file"
-  render_config || true
-  start_service || true
-}
-
 save_node_bundle() {
   local tag="$1"
   local node_json="$2"
   local secret_json="$3"
-  json_set_record "${NODES_FILE}" "$tag" "$node_json"
-  json_set_record "${SECRETS_FILE}" "$tag" "$secret_json"
+  validate_storage_tables || return 1
+  json_set_record "${NODES_FILE}" "$tag" "$node_json" || return 1
+  json_set_record "${SECRETS_FILE}" "$tag" "$secret_json" || return 1
   invalidate_port_caches
 }
 
-# mihomo 配置为 YAML：标量统一单引号包裹（规避特殊字符），内嵌单引号按 YAML 规则双写。
+# JSON 双引号标量是合法 YAML。额外转义 JSON 可裸写而 YAML 会折叠或拒绝的字符。
+# 从 stdin 读取，避免把密码等标量作为 jq 的进程参数传递。
 yaml_quote() {
-  printf "'%s'" "${1//\'/\'\'}"
+  printf '%s' "$1" | jq -Rrs '
+    def hex4:
+      . as $n | [4096, 256, 16, 1] | map(
+        . as $place | (($n / $place | floor) % 16) as $digit |
+        "0123456789abcdef"[$digit:($digit + 1)]
+      ) | join("");
+    @json | gsub("(?<c>[\u007f-\u009f\u2028\u2029\ufffe\uffff])";
+                 "\\u" + (.c | explode[0] | hex4))'
 }
 
-# B4/4.2：DNS 块默认开启（空 dns_servers 走一组加密 DNS，降低解析延迟并抗污染）；
-#   dns_servers=off|none 可整体关闭；非法格式不渲染（无输出）。逗号分隔多源。
-#   strategy 跟随全局 ip_version（auto→prefer_ipv4，6→prefer_ipv6）。
-#   mihomo 不识别 h3:// scheme（报 "DNS NameServer unsupport scheme: h3"），
-#   h3://host 等价归一为 https://host/dns-query 并打开 dns.prefer-h3。
-#   local 名用 __ 前缀：dns_servers 是环境变量键名，同名局部变量会在
-#   env_var 的间接引用（${!key}）中命中空值（bash 动态作用域）
+yaml_emit() {
+  local format="$1" value quoted
+  local -a values=()
+  shift
+  for value in "$@"; do
+    quoted="$(yaml_quote "$value")" || return 1
+    values+=("$quoted")
+  done
+  # shellcheck disable=SC2059  # 格式字符串来自固定的配置模板
+  printf "$format" "${values[@]}"
+}
+
+# DNS 默认开启。返回 1 表示显式关闭，返回 2 表示非法输入，失败时不输出半个配置块。
 render_dns_object() {
-  local __dns_servers __ds __strategy __hit
+  local __dns_servers="${dns_servers:-}" __ds __strategy __bootstrap __host
   local prefer_h3=0
-  __dns_servers="$(env_var "dns_servers")"
+  local -a __sources=() __quoted=()
+
+  # 仅允许单行逗号分隔，首尾允许空格，不做 shell 分词或路径名展开。
+  [[ "$__dns_servers" != *[$'\r\n']* ]] || return 2
+  while [[ "$__dns_servers" == [[:blank:]]* ]]; do __dns_servers="${__dns_servers#?}"; done
+  while [[ "$__dns_servers" == *[[:blank:]] ]]; do __dns_servers="${__dns_servers%?}"; done
   case "${__dns_servers,,}" in
-  off | none | 0 | false | disabled)
-    return 1
-    ;;
+    off | none | 0 | false | disabled) return 1 ;;
   esac
-  # 4.2：未显式配置时默认提供一组加密 DNS（1.1.1.1 + dns.google 双源）
-  [ -n "${__dns_servers}" ] || __dns_servers="https://1.1.1.1/dns-query,https://dns.google/resolve"
-  case "$(manager_env_or_setting "ip_version" "4")" in
-  6 | v6) __strategy="prefer_ipv6" ;;
-  *) __strategy="prefer_ipv4" ;;
-  esac
-  __hit=0
-  printf 'dns:\n'
-  printf '  enable: true\n'
-  printf '  ipv6: true\n'
-  printf '  nameserver:\n'
-  for __ds in ${__dns_servers//,/ }; do
-    [ -n "${__ds}" ] || continue
-    case "${__ds}" in
-    https://* | tls://* | udp://* | quic://* | tcp://*) __hit=1 ;;
-    h3://*)
-      __hit=1
-      prefer_h3=1
-      __ds="https://$(printf '%s' "${__ds#h3://}" | sed 's#/.*##')/dns-query"
+
+  case "$(manager_env_or_setting ip_version 4)" in
+    6 | v6)
+      __strategy=prefer_ipv6
+      __bootstrap='[2606:4700:4700::1111]'
+      __dns_servers="${__dns_servers:-https://[2606:4700:4700::1111]/dns-query,https://dns.google/dns-query}"
       ;;
     *)
-      return 1
+      __strategy=prefer_ipv4
+      __bootstrap=8.8.8.8
+      __dns_servers="${__dns_servers:-https://1.1.1.1/dns-query,https://dns.google/resolve}"
       ;;
+  esac
+
+  # 最后的空项由 read 省去，单独拒绝。其余空项会在循环内被拒绝。
+  [[ "$__dns_servers" != *, ]] || return 2
+  IFS=, read -r -a __sources <<<"$__dns_servers" || return 2
+  for __ds in "${__sources[@]}"; do
+    while [[ "$__ds" == [[:blank:]]* ]]; do __ds="${__ds#?}"; done
+    while [[ "$__ds" == *[[:blank:]] ]]; do __ds="${__ds%?}"; done
+    [[ "$__ds" != *[[:space:][:cntrl:]]* ]] || return 2
+    case "$__ds" in
+      https://?* | tls://?* | udp://?* | quic://?* | tcp://?*) ;;
+      h3://?*)
+        prefer_h3=1
+        __host="${__ds#h3://}"
+        case "$__host" in
+          */*) __ds="https://$__host" ;;
+          *) __ds="https://$__host/dns-query" ;;
+        esac
+        ;;
+      *) return 2 ;;
     esac
-    printf '    - %s\n' "$(yaml_quote "${__ds}")"
+    __ds="$(yaml_quote "$__ds")" || return 2
+    __quoted+=("$__ds")
   done
-  [ "${__hit}" = 1 ] || return 1
-  printf '  default-nameserver:\n'
-  printf '    - %s\n' "$(yaml_quote "8.8.8.8")"
-  printf '  proxy-server-nameserver:\n'
-  printf '    - %s\n' "$(yaml_quote "8.8.8.8")"
-  if [ "${prefer_h3}" = 1 ]; then
-    printf '  prefer-h3: true\n'
+  __bootstrap="$(yaml_quote "$__bootstrap")" || return 2
+
+  printf 'dns:\n  enable: true\n  ipv6: true\n  nameserver:\n' || return 2
+  printf '    - %s\n' "${__quoted[@]}" || return 2
+  printf '  default-nameserver:\n    - %s\n  proxy-server-nameserver:\n    - %s\n' "$__bootstrap" "$__bootstrap" || return 2
+  if [ "$prefer_h3" = 1 ]; then
+    printf '  prefer-h3: true\n' || return 2
   fi
-  printf '  strategy: %s\n' "${__strategy}"
+  printf '  strategy: %s\n' "$__strategy" || return 2
 }
 
 # 1.2：可观测面开关。clash_api 仅监听 127.0.0.1（无暴露风险），secret 随机生成持久化。
@@ -96,23 +114,28 @@ clash_api_port() {
 }
 
 ensure_clash_api_secret() {
-  local s
-  s="$(get_setting "clash_api_secret")"
-  if [ -z "${s}" ]; then
-    s="$(generate_hex 16)"
-    set_setting "clash_api_secret" "${s}"
+  local secret
+  secret="$(get_setting clash_api_secret)" || return 1
+  if [ -z "$secret" ]; then
+    secret="$(generate_hex 16)" || return 1
+    [[ "$secret" =~ ^[0-9a-fA-F]{32}$ ]] || return 1
+    set_setting clash_api_secret "$secret" || return 1
   fi
-  printf '%s' "${s}"
+  [[ "$secret" != *[[:cntrl:]]* ]] && [ -n "$secret" ] || return 1
+  printf '%s' "$secret"
 }
 
-# clash_api 基础 curl。controller 或 secret 缺失/curl 不可用时返回失败。
+# 查询接口只读取既有凭据，curl 从 stdin 读取鉴权头，避免进程参数暴露令牌。
 clash_api_fetch() {
-  local _p="$1" _out
+  local path="$1" out secret port
   command_exists curl || return 1
-  _out="$(curl -fsS --max-time 4 -H "Authorization: Bearer $(ensure_clash_api_secret)" \
-    "http://127.0.0.1:$(clash_api_port)${_p}" 2>/dev/null || true)"
-  [ -n "${_out}" ] || return 1
-  printf '%s' "${_out}"
+  secret="$(get_setting clash_api_secret)" || return 1
+  [ -n "$secret" ] && [[ "$secret" != *[[:cntrl:]]* ]] || return 1
+  port="$(clash_api_port)" || return 1
+  out="$(printf 'Authorization: Bearer %s\n' "$secret" |
+    curl -fsS --max-time 4 --header @- "http://127.0.0.1:$port$path" 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
 }
 
 # 1.2：活跃连接汇总行（数量 + 上下行速率），供 mm status 展示。
@@ -148,6 +171,7 @@ clash_api_dump_connections() {
   local _out
   _out="$(clash_api_fetch "/connections" 2>/dev/null || true)"
   [ -n "${_out}" ] || return 0
+  rotate_log_file "${RUNTIME_DIR}/clash-api-dump.log" >/dev/null 2>&1 || true
   {
     printf '\n[%s] clash_api connections dump（探活失败快照）：\n' "$(date -Is 2>/dev/null || date +%s)"
     printf '%s\n' "${_out}" | jq '{downloadTotal, uploadTotal, connections: [(.connections|length)]}' 2>/dev/null || printf '%s\n' "${_out}"
@@ -162,133 +186,158 @@ _fmt_mbps() {
 }
 
 render_config() {
-  local tmp tags listeners_block dns_block item
+  local tmp tags tag listeners_block="" dns_block item rc log_level api_port="" api_secret=""
+  validate_storage_tables || return 1
   migrate_custom_certificates || return 1
   if ! tags="$(iter_node_tags)"; then
     print_err "读取节点列表失败。"
     return 1
   fi
-  listeners_block=""
-  while IFS= read -r tag; do
-    [ -n "${tag}" ] || continue
-    if ! item="$(render_inbound_for_tag "${tag}")"; then
-      print_err "生成 mihomo 入站配置失败。"
+  if clash_api_enabled; then
+    api_port="$(clash_api_port)" || return 1
+    if metadata_has_port "$api_port"; then
+      print_err "Clash API 端口与已配置节点冲突：$api_port"
       return 1
     fi
-    listeners_block="${listeners_block}${item}"$'\n'
-  done <<<"${tags}"
-
-  tmp="$(mktemp "${BASE_DIR}/.config.XXXXXX")"
-  # 数据面日志等级可调（info/debug），生产默认 warning 降低高负载磁盘 IO
-  local log_level
-  log_level="$(manager_env_or_setting "log_level" "")"
-  if [ "$(manager_env_or_setting "debug_flag" "0")" = "1" ]; then
-    log_level="debug"
   fi
-  case "${log_level}" in
-  "info" | "debug") : ;;
-  *) log_level="warning" ;;
+  while IFS= read -r tag; do
+    [ -n "$tag" ] || continue
+    if ! item="$(render_inbound_for_tag "$tag")"; then
+      print_err "生成 mihomo 入站配置失败：$tag"
+      return 1
+    fi
+    listeners_block="$listeners_block$item"$'\n'
+  done <<<"$tags"
+
+  if dns_block="$(render_dns_object)"; then
+    :
+  else
+    rc=$?
+    if [ "$rc" -ne 1 ]; then
+      print_err 'DNS 配置无效，已拒绝覆盖现有配置。'
+      return 1
+    fi
+  fi
+
+  log_level="$(manager_env_or_setting log_level '')" || return 1
+  if [ "$(manager_env_or_setting debug_flag 0)" = 1 ]; then
+    log_level=debug
+  fi
+  case "$log_level" in
+    info | debug) ;;
+    *) log_level=warning ;;
   esac
+  if [ -n "$api_port" ]; then
+    api_secret="$(ensure_clash_api_secret)" || return 1
+    api_secret="$(yaml_quote "$api_secret")" || return 1
+    api_port="$(yaml_quote "127.0.0.1:$api_port")" || return 1
+  fi
 
-  {
-    printf '# Generated by %s v%s\n' "${PROJECT_NAME}" "${SCRIPT_VERSION}"
-    printf 'mode: direct\n'
-    printf 'log-level: %s\n' "${log_level}"
-    printf 'ipv6: true\n'
-    printf 'unified-delay: true\n'
-    printf 'tcp-keep-alive-idle: 120\n'
-    printf 'keep-alive-interval: 30\n'
-    printf 'profile:\n'
-    printf '  store-selected: false\n'
-    if clash_api_enabled; then
-      printf 'external-controller: %s\n' "$(yaml_quote "127.0.0.1:$(clash_api_port)")"
-      printf 'secret: %s\n' "$(yaml_quote "$(ensure_clash_api_secret)")"
-    fi
-    if dns_block="$(render_dns_object 2>/dev/null)"; then
-      printf '%s\n' "${dns_block}"
-    fi
-    if [ -n "${listeners_block}" ]; then
-      printf 'listeners:\n'
-      printf '%s\n' "${listeners_block}"
-    fi
-  } >"${tmp}" || {
-    rm -f "${tmp}"
-    print_err "写入 mihomo 配置失败。"
-    return 1
-  }
-  # S4：落盘前用 mihomo 校验 tmp，失败则删除 tmp、保留旧配置并报错（fail-closed）
-  if [ -n "${MIHOMO_BIN:-}" ] && [ -x "${MIHOMO_BIN}" ] && ! "${MIHOMO_BIN}" -t -f "${tmp}" >/dev/null 2>&1; then
-    rm -f "${tmp}"
-    print_err "mihomo 配置校验失败，已拒绝覆盖现有配置（旧配置保留）。"
+  tmp="$(mktemp "${BASE_DIR}/.config.XXXXXX")" || return 1
+  if ! (
+    printf '# Generated by %s v%s\n' "${PROJECT_NAME}" "${SCRIPT_VERSION}" &&
+    printf 'mode: direct\nlog-level: %s\nipv6: true\nunified-delay: true\n' "$log_level" &&
+    printf 'tcp-keep-alive-idle: 120\nkeep-alive-interval: 30\nprofile:\n  store-selected: false\n' &&
+    { [ -z "$api_port" ] || printf 'external-controller: %s\nsecret: %s\n' "$api_port" "$api_secret"; } &&
+    { [ -z "$dns_block" ] || printf '%s\n' "$dns_block"; } &&
+    { [ -z "$listeners_block" ] || printf 'listeners:\n%s' "$listeners_block"; }
+  ) >"$tmp"; then
+    rm -f -- "$tmp"
+    print_err '写入 mihomo 配置失败。'
     return 1
   fi
-  if ! chmod 600 "${tmp}" || ! mv "${tmp}" "${CONFIG_FILE}"; then
-    rm -f "${tmp}"
-    print_err "保存 mihomo 配置失败。"
+  # 使用与服务相同的工作目录和 SAFE_PATHS 验证，再原子替换主配置。
+  if ! mihomo_validate "$tmp" >/dev/null 2>&1; then
+    rm -f -- "$tmp"
+    print_err 'mihomo 配置校验失败，已拒绝覆盖现有配置。'
+    return 1
+  fi
+  if ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "${CONFIG_FILE}"; then
+    rm -f -- "$tmp"
+    print_err '保存 mihomo 配置失败。'
     return 1
   fi
   print_info "已生成并校验 ${CONFIG_FILE}（mihomo -t 通过）。"
 }
 
+# 25 个固定索引字段。NUL 作为分隔符，空字符串、换行、CR 和反斜杠都原样传递。
 node_meta() {
   local tag="$1"
-  # 单进程 jq 合并 nodes+secrets 输出 25 个字段（每行一个，空值输出空行），
-  # 字段路径与 node_value/secret_value（.[$tag][$field]）完全一致；
-  # 渲染/分享链接按节点仅启动 1 次 jq，替代逐字段 node_value/secret_value 的多次启动。
-  # 输出用"每行一个字段"而非 tab 分隔：bash 的 read/cut 会合并连续 tab 并吞掉空字段，
-  # 空行则能被 while read 完整保留。
-  jq -n -r --arg tag "$tag" \
+  jq -n -j --arg tag "$tag" \
     --rawfile nodes "${NODES_FILE}" \
     --rawfile secrets "${SECRETS_FILE}" '
-    ($nodes | fromjson | .[$tag] // {}) as $n |
-    ($secrets | fromjson | .[$tag] // {}) as $s |
+    def record($table):
+      ($table | fromjson) as $rows |
+      if ($rows | type) == "object" and ($rows[$tag] | type) == "object"
+      then $rows[$tag] else error("missing or invalid node record") end;
+    def field:
+      if . == null then ""
+      elif type == "string" or type == "number" then tostring
+      else error("unsupported node metadata field type") end |
+      if (explode | index(0)) == null then .
+      else error("NUL in node metadata field") end;
+    record($nodes) as $n | record($secrets) as $s |
     [
-      ($n.protocol // ""),
-      ($n.name // ""),
-      (($n.port // "") | tostring),
-      ($s.uuid // ""),
-      ($s.password // ""),
-      ($s.private_key // ""),
-      ($n.public_key // ""),
-      ($n.short_id // ""),
-      ($n.reality_server // ""),
-      ($n.tls_server // ""),
-      ($n.preferred_domain // ""),
-      ($n.host_domain // ""),
-      ($n.ws_path // ""),
-      ($n.ws_mode // ""),
-      (($n.cdn_port // "") | tostring),
-      ($n.cdn_sni // ""),
-      ($n.certificate_mode // ""),
-      ($n.certificate_path // ""),
-      ($n.key_path // ""),
-      ($n.endpoint_domain // ""),
-      ($n.argo_mode // ""),
-      ($s.argo_token // ""),
-      (($n.up_mbps // "") | tostring),
-      (($n.down_mbps // "") | tostring),
-      ($n.username // "")
-    ] | .[]
+      ($n.protocol),
+      ($n.name),
+      ($n.port),
+      ($s.uuid),
+      ($s.password),
+      ($s.private_key),
+      ($n.public_key),
+      ($n.short_id),
+      ($n.reality_server),
+      ($n.tls_server),
+      ($n.preferred_domain),
+      ($n.host_domain),
+      ($n.ws_path),
+      ($n.ws_mode),
+      ($n.cdn_port),
+      ($n.cdn_sni),
+      ($n.certificate_mode),
+      ($n.certificate_path),
+      ($n.key_path),
+      ($n.endpoint_domain),
+      ($n.argo_mode),
+      ($s.argo_token),
+      ($n.up_mbps),
+      ($n.down_mbps),
+      ($n.username)
+    ] | map(field) | .[] + "\u0000"
   '
 }
 
 node_meta_array() {
-  local tag="$1" i=0 _f
+  local tag="$1" i=0 field
+  local -a fields=()
   NODE_META=()
-  while IFS= read -r _f; do
-    NODE_META[i++]="${_f%$'\r'}"
-    [ "$i" -ge 25 ] && break
-  done < <(node_meta "$tag")
-  while [ "$i" -lt 25 ]; do NODE_META[i++]=""; done
+  while IFS= read -r -d '' field; do
+    fields[i++]="$field"
+  done < <(node_meta "$tag" && printf 'complete\0')
+  # 完成标记只在生产者成功时发送，兼容 Bash 4 无法等待进程替换 PID 的版本。
+  [ "$i" -eq 26 ] && [ "${fields[25]}" = complete ] || return 1
+  unset 'fields[25]'
+  NODE_META=("${fields[@]}")
+}
+
+_render_certificate_path() {
+  local file="$1"
+  # 兼容旧版托管文件名。路径必须是 CERT_DIR 下的普通文件，且不能嵌套。
+  case "$file" in
+    "${CERT_DIR%/}"/*)
+      [[ "${file#"${CERT_DIR%/}"/}" != */* ]] && [ -f "$file" ] && [ ! -L "$file" ]
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 render_inbound_for_tag() {
   local tag="$1"
-  local protocol name port uuid password cert_file key_file ws_path reality_server tls_server
+  local protocol name port uuid password cert_file key_file ws_path reality_server
   local up_mbps down_mbps private_key short_id username
 
   # 单次 jq 批量取出 nodes+secrets 全部字段，替代逐字段 node_value/secret_value（每节点省多次 jq 启动）
-  node_meta_array "$tag"
+  node_meta_array "$tag" || return 1
   protocol="${NODE_META[0]}"
   name="${NODE_META[1]}"
   port="${NODE_META[2]}"
@@ -297,125 +346,142 @@ render_inbound_for_tag() {
   private_key="${NODE_META[5]}"
   short_id="${NODE_META[7]}"
   reality_server="${NODE_META[8]}"
-  tls_server="${NODE_META[9]}"
   ws_path="${NODE_META[12]}"
   cert_file="${NODE_META[17]}"
   key_file="${NODE_META[18]}"
   up_mbps="${NODE_META[22]}"
   down_mbps="${NODE_META[23]}"
   username="${NODE_META[24]}"
-  # 全局速率默认 200 Mbps（与旧缺省一致）；mihomo hy2 以字符串 "N Mbps" 表达
-  up_mbps="${up_mbps:-200}"
-  down_mbps="${down_mbps:-200}"
-  [[ "${port}" =~ ^[0-9]+$ ]] || port=0
+  if ! port="$(normalize_node_port "$port")"; then
+    print_err "节点端口无效：$tag"
+    return 1
+  fi
+
+  # 自定义证书先迁移到托管目录，拒绝从其他位置渲染路径或加载符号链接。
+  case "$protocol" in
+    vless-ws-tls | anytls | tuic-v5 | hy2)
+      if ! _render_certificate_path "$cert_file" || ! _render_certificate_path "$key_file"; then
+        print_err "节点证书或私钥不在托管证书目录：$tag"
+        return 1
+      fi
+      ;;
+  esac
 
   case "$protocol" in
   vless-reality)
-    printf '  - type: vless\n'
-    printf '    name: %s\n' "$(yaml_quote "$tag")"
-    printf '    listen: %s\n' "$(yaml_quote '::')"
-    printf '    port: %s\n' "$port"
-    printf '    users:\n'
-    printf '      - username: %s\n' "$(yaml_quote "$name")"
-    printf '        uuid: %s\n' "$(yaml_quote "$uuid")"
-    printf '        flow: xtls-rprx-vision\n'
-    printf '    reality-config:\n'
-    printf '      dest: %s\n' "$(yaml_quote "${reality_server}:443")"
-    printf '      private-key: %s\n' "$(yaml_quote "$private_key")"
-    _emit_short_ids "$short_id"
-    printf '      server-names:\n'
-    printf '        - %s\n' "$(yaml_quote "$reality_server")"
+    printf '  - type: vless\n' || return 1
+    yaml_emit '    name: %s\n' "$tag" || return 1
+    yaml_emit '    listen: %s\n' '::' || return 1
+    printf '    port: %s\n' "$port" || return 1
+    printf '    users:\n' || return 1
+    yaml_emit '      - username: %s\n' "$name" || return 1
+    yaml_emit '        uuid: %s\n' "$uuid" || return 1
+    printf '        flow: xtls-rprx-vision\n' || return 1
+    printf '    reality-config:\n' || return 1
+    yaml_emit '      dest: %s\n' "${reality_server}:443" || return 1
+    yaml_emit '      private-key: %s\n' "$private_key" || return 1
+    _emit_short_ids "$short_id" || return 1
+    printf '      server-names:\n' || return 1
+    yaml_emit '        - %s\n' "$reality_server" || return 1
     ;;
   vless-xudp)
     # VLESS + Reality + XUDP：XUDP 是 VLESS 的 UDP-over-TCP 封装，
     # Mihomo listener 收到 CommandMux 后自动处理，不需要 packet-encoding/mux 配置。
-    printf '  - type: vless\n'
-    printf '    name: %s\n' "$(yaml_quote "$tag")"
-    printf '    listen: %s\n' "$(yaml_quote '::')"
-    printf '    port: %s\n' "$port"
-    printf '    users:\n'
-    printf '      - username: %s\n' "$(yaml_quote "$name")"
-    printf '        uuid: %s\n' "$(yaml_quote "$uuid")"
-    printf '    reality-config:\n'
-    printf '      dest: %s\n' "$(yaml_quote "${reality_server}:443")"
-    printf '      private-key: %s\n' "$(yaml_quote "$private_key")"
-    _emit_short_ids "$short_id"
-    printf '      server-names:\n'
-    printf '        - %s\n' "$(yaml_quote "$reality_server")"
+    printf '  - type: vless\n' || return 1
+    yaml_emit '    name: %s\n' "$tag" || return 1
+    yaml_emit '    listen: %s\n' '::' || return 1
+    printf '    port: %s\n' "$port" || return 1
+    printf '    users:\n' || return 1
+    yaml_emit '      - username: %s\n' "$name" || return 1
+    yaml_emit '        uuid: %s\n' "$uuid" || return 1
+    printf '    reality-config:\n' || return 1
+    yaml_emit '      dest: %s\n' "${reality_server}:443" || return 1
+    yaml_emit '      private-key: %s\n' "$private_key" || return 1
+    _emit_short_ids "$short_id" || return 1
+    printf '      server-names:\n' || return 1
+    yaml_emit '        - %s\n' "$reality_server" || return 1
     ;;
   vless-ws-tls)
     # 主 listener：TLS 端口（CDN 模式统一单端口：客户端连 CDN 边缘，CF 按 SSL 模式
     # Full/Full(Strict) 以 HTTPS 回源到本 TLS 端口，无需明文回源 listener）。
     # mihomo 无独立 "vless (ws)" 类型：type 仍为 vless，靠 ws-path 判定 WS 传输。
-    printf '  - type: vless\n'
-    printf '    name: %s\n' "$(yaml_quote "$tag")"
-    printf '    listen: %s\n' "$(yaml_quote '::')"
-    printf '    port: %s\n' "$port"
-    printf '    users:\n'
-    printf '      - username: %s\n' "$(yaml_quote "$name")"
-    printf '        uuid: %s\n' "$(yaml_quote "$uuid")"
-    printf '    ws-path: %s\n' "$(yaml_quote "$ws_path")"
-    printf '    certificate: %s\n' "$(yaml_quote "$cert_file")"
-    printf '    private-key: %s\n' "$(yaml_quote "$key_file")"
+    printf '  - type: vless\n' || return 1
+    yaml_emit '    name: %s\n' "$tag" || return 1
+    yaml_emit '    listen: %s\n' '::' || return 1
+    printf '    port: %s\n' "$port" || return 1
+    printf '    users:\n' || return 1
+    yaml_emit '      - username: %s\n' "$name" || return 1
+    yaml_emit '        uuid: %s\n' "$uuid" || return 1
+    yaml_emit '    ws-path: %s\n' "$ws_path" || return 1
+    yaml_emit '    certificate: %s\n' "$cert_file" || return 1
+    yaml_emit '    private-key: %s\n' "$key_file" || return 1
     ;;
   anytls)
-    printf '  - type: anytls\n'
-    printf '    name: %s\n' "$(yaml_quote "$tag")"
-    printf '    listen: %s\n' "$(yaml_quote '::')"
-    printf '    port: %s\n' "$port"
-    printf '    users:\n'
-    printf '      %s: %s\n' "$(yaml_quote "$name")" "$(yaml_quote "$password")"
-    printf '    certificate: %s\n' "$(yaml_quote "$cert_file")"
-    printf '    private-key: %s\n' "$(yaml_quote "$key_file")"
+    printf '  - type: anytls\n' || return 1
+    yaml_emit '    name: %s\n' "$tag" || return 1
+    yaml_emit '    listen: %s\n' '::' || return 1
+    printf '    port: %s\n' "$port" || return 1
+    printf '    users:\n' || return 1
+    yaml_emit '      %s: %s\n' "$name" "$password" || return 1
+    yaml_emit '    certificate: %s\n' "$cert_file" || return 1
+    yaml_emit '    private-key: %s\n' "$key_file" || return 1
     ;;
   vless-argo)
     # Argo：cloudflared 隧道回源到本机明文 WS listener，无 TLS；
     # mihomo vless listener 无证书时需 allow-insecure 才允许启动。
-    printf '  - type: vless\n'
-    printf '    name: %s\n' "$(yaml_quote "$tag")"
-    printf '    listen: %s\n' "$(yaml_quote '127.0.0.1')"
-    printf '    port: %s\n' "$port"
-    printf '    users:\n'
-    printf '      - username: %s\n' "$(yaml_quote "$name")"
-    printf '        uuid: %s\n' "$(yaml_quote "$uuid")"
-    printf '    ws-path: %s\n' "$(yaml_quote "$ws_path")"
-    printf '    allow-insecure: true\n'
+    printf '  - type: vless\n' || return 1
+    yaml_emit '    name: %s\n' "$tag" || return 1
+    yaml_emit '    listen: %s\n' '127.0.0.1' || return 1
+    printf '    port: %s\n' "$port" || return 1
+    printf '    users:\n' || return 1
+    yaml_emit '      - username: %s\n' "$name" || return 1
+    yaml_emit '        uuid: %s\n' "$uuid" || return 1
+    yaml_emit '    ws-path: %s\n' "$ws_path" || return 1
+    printf '    allow-insecure: true\n' || return 1
     ;;
   tuic-v5)
-    printf '  - type: tuic\n'
-    printf '    name: %s\n' "$(yaml_quote "$tag")"
-    printf '    listen: %s\n' "$(yaml_quote '::')"
-    printf '    port: %s\n' "$port"
-    printf '    users:\n'
-    printf '      %s: %s\n' "$(yaml_quote "$uuid")" "$(yaml_quote "$password")"
-    printf '    congestion-controller: bbr\n'
-    printf '    alpn:\n'
-    printf '      - h3\n'
-    printf '    certificate: %s\n' "$(yaml_quote "$cert_file")"
-    printf '    private-key: %s\n' "$(yaml_quote "$key_file")"
+    printf '  - type: tuic\n' || return 1
+    yaml_emit '    name: %s\n' "$tag" || return 1
+    yaml_emit '    listen: %s\n' '::' || return 1
+    printf '    port: %s\n' "$port" || return 1
+    printf '    users:\n' || return 1
+    yaml_emit '      %s: %s\n' "$uuid" "$password" || return 1
+    printf '    congestion-controller: bbr\n' || return 1
+    printf '    alpn:\n' || return 1
+    printf '      - h3\n' || return 1
+    yaml_emit '    certificate: %s\n' "$cert_file" || return 1
+    yaml_emit '    private-key: %s\n' "$key_file" || return 1
     ;;
   hy2)
-    printf '  - type: hysteria2\n'
-    printf '    name: %s\n' "$(yaml_quote "$tag")"
-    printf '    listen: %s\n' "$(yaml_quote '::')"
-    printf '    port: %s\n' "$port"
-    printf '    users:\n'
-    printf '      %s: %s\n' "$(yaml_quote "$name")" "$(yaml_quote "$password")"
-    printf '    up: %s Mbps\n' "$up_mbps"
-    printf '    down: %s Mbps\n' "$down_mbps"
-    printf '    alpn:\n'
-    printf '      - h3\n'
-    printf '    certificate: %s\n' "$(yaml_quote "$cert_file")"
-    printf '    private-key: %s\n' "$(yaml_quote "$key_file")"
+    if ! up_mbps="$(normalize_hy2_mbps "$up_mbps")" || ! down_mbps="$(normalize_hy2_mbps "$down_mbps")"; then
+      print_err "HY2 节点带宽无效：$tag"
+      return 1
+    fi
+    printf '  - type: hysteria2\n' || return 1
+    yaml_emit '    name: %s\n' "$tag" || return 1
+    yaml_emit '    listen: %s\n' '::' || return 1
+    printf '    port: %s\n' "$port" || return 1
+    printf '    users:\n' || return 1
+    yaml_emit '      %s: %s\n' "$name" "$password" || return 1
+    [ "$up_mbps" = 0 ] || yaml_emit '    up: %s\n' "$up_mbps Mbps" || return 1
+    [ "$down_mbps" = 0 ] || yaml_emit '    down: %s\n' "$down_mbps Mbps" || return 1
+    # 两向均不限速时让内核忽略客户端的限速建议，使用 BBR 自适应拥塞控制。
+    if [ "$up_mbps" = 0 ] && [ "$down_mbps" = 0 ]; then
+      printf '    ignore-client-bandwidth: true\n' || return 1
+    fi
+    printf '    alpn:\n' || return 1
+    printf '      - h3\n' || return 1
+    yaml_emit '    certificate: %s\n' "$cert_file" || return 1
+    yaml_emit '    private-key: %s\n' "$key_file" || return 1
     ;;
   socks5)
-    printf '  - type: socks\n'
-    printf '    name: %s\n' "$(yaml_quote "$tag")"
-    printf '    listen: %s\n' "$(yaml_quote '::')"
-    printf '    port: %s\n' "$port"
-    printf '    users:\n'
-    printf '      - username: %s\n' "$(yaml_quote "$username")"
-    printf '        password: %s\n' "$(yaml_quote "$password")"
+    printf '  - type: socks\n' || return 1
+    yaml_emit '    name: %s\n' "$tag" || return 1
+    yaml_emit '    listen: %s\n' '::' || return 1
+    printf '    port: %s\n' "$port" || return 1
+    printf '    users:\n' || return 1
+    yaml_emit '      - username: %s\n' "$username" || return 1
+    yaml_emit '        password: %s\n' "$password" || return 1
     ;;
   *)
     print_err "不支持的节点协议：${protocol}"
@@ -429,10 +495,10 @@ _emit_short_ids() {
   local value="$1" _s
   local -a __ids
   [ -n "${value}" ] || return 0
-  IFS=, read -ra __ids <<<"${value}"
-  printf '      short-id:\n'
+  IFS=, read -r -d '' -a __ids < <(printf '%s\0' "${value}") || return 1
+  printf '      short-id:\n' || return 1
   for _s in "${__ids[@]}"; do
     [ -n "${_s}" ] || continue
-    printf '        - %s\n' "$(yaml_quote "${_s}")"
+    yaml_emit '        - %s\n' "${_s}" || return 1
   done
 }

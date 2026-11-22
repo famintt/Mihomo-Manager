@@ -1,118 +1,165 @@
 #!/usr/bin/env bash
-# accept-mihomo.sh —— mihomo 迁移验收（交付判定链）
-#
-# 用途：在任一台机器（VPS 相同）复跑仓库 render 链，用真 mihomo 二进制做唯一
-# schema 法官，逐条断言均已附真字段级判决字节（`mihomo -t -f` rc=0 + 实监听）。
-#
-# 用法：
-#   MIHOMO_BIN=${MIHOMO_BIN:-/tmp/opencode/mihomo} ./tests/accept-mihomo.sh
-# shellcheck disable=SC1090
+# Run against the pinned real Linux Mihomo binary; never downloads or installs services.
+# Usage: MIHOMO_BIN=/absolute/path/mihomo bash tests/accept-mihomo.sh
+# shellcheck disable=SC1090,SC2034,SC2016
 set -eEuo pipefail
-
-# ---- 0. 自检：本仓库是否存在（路径两拼兼容） ----
-if [ -d ./lib ]; then :; elif [ -d ../lib ]; then cd ..; else
-  printf '[1;31m[错误][0m 未能在仓库上下文运行（找不到 lib/）。\n' >&2
-  exit 2
-fi
-
-# ---- 1. 真二进制就位 ----
+umask 077
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MIHOMO_BIN="${MIHOMO_BIN:-/tmp/opencode/mihomo}"
-if [ ! -x "${MIHOMO_BIN}" ]; then
-  printf '[错误] 未找到真 mihomo 二进制：%s\n' "${MIHOMO_BIN}" >&2
-  printf '       从 https://github.com/MetaCubeX/mihomo/releases 取 v1.19.31 后重试。\n' >&2
-  exit 2
-fi
-_ver="$("${MIHOMO_BIN}" -v 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-printf '== 真二进制 == %s (%s)\n' "${MIHOMO_BIN}" "${_ver:-?}"
-
-# ---- 2. 隔离沙箱：BASE_DIR 即 mihomo 的 -d 工作目录（证书 SAFE_PATHS 之内） ----
-export BASE_DIR="${BASE_DIR:-$(mktemp -d)/etc}"
-export LIB_DIR="${LIB_DIR:-$(mktemp -d)/lib}"
-mkdir -p "${BASE_DIR}"
-for f in lib/env.sh lib/io.sh lib/storage.sh lib/settings.sh lib/cert.sh lib/render.sh; do
-  if [ -f "${f}" ]; then . "${f}"; else printf '[错误] 缺 %s\n' "${f}" >&2; exit 2; fi
+[ -x "$MIHOMO_BIN" ] || { printf 'Missing real Mihomo binary: %s\n' "$MIHOMO_BIN" >&2; exit 2; }
+MIHOMO_BIN="$(readlink -f -- "$MIHOMO_BIN")"
+[ "$(od -An -tx1 -N4 "$MIHOMO_BIN" | tr -d ' \n')" = 7f454c46 ] || {
+  printf 'Acceptance requires a real Linux ELF binary.\n' >&2; exit 2;
+}
+for tool in jq python3 openssl ss; do command -v "$tool" >/dev/null || exit 2; done
+TEST_ROOT="$(mktemp -d)"
+export BASE_DIR="$TEST_ROOT/etc" LIB_DIR="$TEST_ROOT/lib" INSTALL_BIN="$TEST_ROOT/mm"
+export LOCK_ROOT="$TEST_ROOT/locks" LOCK_FILE="$TEST_ROOT/locks/accept.lock" MM_TEST_MODE=1
+export MIHOMO_DATA_DIR="$TEST_ROOT/etc/data" PUBLIC_IP_CACHE=8.8.8.8
+export HOME="$TEST_ROOT/home" XDG_CONFIG_HOME="$TEST_ROOT/home/.config"
+export clash_api=0 dns_servers=off ip_version=auto net_tune=off
+mkdir -p "$HOME"
+source "$ROOT_DIR/mm.sh"
+KERNEL_PID=''
+stop_kernel() {
+  local i
+  [ -n "$KERNEL_PID" ] || return 0
+  kill -TERM "$KERNEL_PID" 2>/dev/null || true
+  for ((i=0; i<30; i++)); do kill -0 "$KERNEL_PID" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$KERNEL_PID" 2>/dev/null; then kill -KILL "$KERNEL_PID" 2>/dev/null || true; fi
+  wait "$KERNEL_PID" 2>/dev/null || true
+  KERNEL_PID=''
+}
+cleanup_accept() {
+  local status=$?
+  trap - EXIT ERR
+  stop_kernel
+  release_lock
+  if [ "$status" -ne 0 ]; then
+    printf 'Acceptance failed; kernel output follows.\n' >&2
+    [ ! -f "$TEST_ROOT/kernel.log" ] || while IFS= read -r line; do printf '%s\n' "$line" >&2; done <"$TEST_ROOT/kernel.log"
+  fi
+  rm -rf -- "$TEST_ROOT"
+  exit "$status"
+}
+trap cleanup_accept EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# mm.sh installs an ERR trap, but EXIT here owns process and sandbox cleanup.
+trap - ERR
+for helper in mihomo_run mihomo_validate mihomo_data_dir mihomo_safe_paths; do
+  declare -F "$helper" >/dev/null || { printf 'Missing production helper %s\n' "$helper" >&2; exit 1; }
 done
+version="$("$MIHOMO_BIN" -v)"
+[[ "$version" == *" $MIHOMO_VERSION "* ]] || { printf 'Unexpected kernel: %s\n' "$version" >&2; exit 2; }
+printf 'Real kernel: %s\n' "$version"
+acquire_lock
 init_storage
-
-# ---- 3. 静态断言：render.sh 已脱离 sing-box JSON schema，改用 mihomo YAML ----
-_bad_json="$(grep -nE '\.inbounds|listen_port|tcp_fast_open|max_early_data|zero_rtt_handshake|bbr_profile|\.tls\.reality' lib/render.sh || true)"
-if [ -n "${_bad_json}" ]; then
-  printf '[1;31m[错误][0m render.sh 仍残留 sing-box JSON schema 字段：\n%s\n' "${_bad_json}" >&2
-  exit 1
-fi
-printf '== sing-box JSON schema 字段已清除 ==\n'
-_bad_type="$(grep -nE 'type: vless \(ws\)' lib/render.sh || true)"
-if [ -n "${_bad_type}" ]; then
-  printf '[1;31m[错误][0m render.sh 使用非法 mihomo listener 类型 "vless (ws)"：\n%s\n' "${_bad_type}" >&2
-  exit 1
-fi
-for _m in 'listeners:' 'reality-config:' 'congestion-controller: bbr' 'external-controller:' 'allow-insecure: true'; do
-  grep -qF "${_m}" lib/render.sh || {
-    printf '[1;31m[错误][0m render.sh 缺少 mihomo 必需片段：%s\n' "${_m}" >&2
-    exit 1
-  }
-done
-printf '== mihomo YAML 片段齐备 ==\n'
-
-# ---- 4. 组装 6 协议节点（证书落在 BASE_DIR/certs，位于 mihomo SAFE_PATHS 内） ----
-CERT="${BASE_DIR}/certs/accept.crt"
-KEY="${BASE_DIR}/certs/accept.key"
+mkdir -p "$(mihomo_data_dir)"
+# Reserve both transports and families until all candidate numbers are selected.
+mapfile -t PORTS < <(python3 - <<'PY'
+import socket
+held = []
+ports = []
+while len(ports) < 9:
+    trial = []
+    try:
+        tcp4 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        trial.append(tcp4)
+        tcp4.bind(('0.0.0.0', 0))
+        port = tcp4.getsockname()[1]
+        for family, kind, addr in [(socket.AF_INET, socket.SOCK_DGRAM, '0.0.0.0'),
+                                   (socket.AF_INET6, socket.SOCK_STREAM, '::'),
+                                   (socket.AF_INET6, socket.SOCK_DGRAM, '::')]:
+            s = socket.socket(family, kind)
+            trial.append(s)
+            if family == socket.AF_INET6:
+                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            s.bind((addr, port))
+        held.extend(trial)
+        ports.append(port)
+    except OSError:
+        for s in trial:
+            s.close()
+for port in ports:
+    print(port)
+PY
+)
+[ "${#PORTS[@]}" -eq 9 ] || { printf 'Cannot allocate dual-stack ports.\n' >&2; exit 1; }
+CERT="$CERT_DIR/accept.crt"
+KEY="$CERT_DIR/accept.key"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-  -keyout "${KEY}" -out "${CERT}" -days 2 -subj "/CN=www.bing.com" >/dev/null 2>&1
-_rk="$("${MIHOMO_BIN}" generate reality-keypair)"
-_priv="$(printf '%s\n' "${_rk}" | sed -n 's/^PrivateKey: //p')"
-_pub="$(printf '%s\n' "${_rk}" | sed -n 's/^PublicKey: //p')"
-_uuid="b8b1e0c5-ffd5-487f-a7f2-e72faa8fba7b"
-_add() { json_set_record "${NODES_FILE}" "$1" "$2"; json_set_record "${SECRETS_FILE}" "$1" "$3"; }
-_add nreality "{\"protocol\":\"vless-reality\",\"name\":\"HK\",\"port\":30831,\"public_key\":\"${_pub}\",\"short_id\":\"0123456789abcdef\",\"reality_server\":\"www.apple.com\"}" "{\"uuid\":\"${_uuid}\",\"private_key\":\"${_priv}\"}"
-_add nws "{\"protocol\":\"vless-ws-tls\",\"name\":\"HK\",\"port\":30851,\"ws_path\":\"/w\",\"certificate_mode\":\"custom\",\"certificate_path\":\"${CERT}\",\"key_path\":\"${KEY}\"}" "{\"uuid\":\"${_uuid}\"}"
-_add nany "{\"protocol\":\"anytls\",\"name\":\"HK\",\"port\":30861,\"certificate_path\":\"${CERT}\",\"key_path\":\"${KEY}\"}" '{"password":"testpw"}'
-_add ntuic "{\"protocol\":\"tuic-v5\",\"name\":\"HK\",\"port\":30862,\"certificate_path\":\"${CERT}\",\"key_path\":\"${KEY}\"}" "{\"uuid\":\"${_uuid}\",\"password\":\"testpw\"}"
-_add nhy2 "{\"protocol\":\"hy2\",\"name\":\"HK\",\"port\":30853,\"certificate_path\":\"${CERT}\",\"key_path\":\"${KEY}\",\"up_mbps\":100,\"down_mbps\":500}" '{"password":"testpw"}'
-_add nargo "{\"protocol\":\"vless-argo\",\"name\":\"HK\",\"port\":30854,\"ws_path\":\"/a\"}" "{\"uuid\":\"${_uuid}\"}"
-_add nsocks "{\"protocol\":\"socks5\",\"name\":\"HK\",\"port\":30855,\"username\":\"testu\"}" '{"password":"testpw"}'
-
-# ---- 5. 端到端：仓库 render 链产出 config → 真二进制 -t（VPS service.sh 的判决点） ----
-# 关闭 clash_api 可观测面，避免与宿主机既有 19990 端口冲突（本验收只判 listener schema）
-export clash_api=off
-printf '== 仓库 render_config 全链 + 真 %s -t ==\n' "${_ver:-?}"
-rc=0
-render_config >/dev/null 2>&1 || rc=$?
-if [ "${rc}" -ne 0 ]; then
-  printf '[1;31m[错误][0m 仓库 render 链 -t rc=%s（VPS 同链会在此中止）。\n' "${rc}" >&2
-  exit 1
-fi
-assert_listeners="$(grep -cE '^  - type:' "${CONFIG_FILE}")"
-if [ "${assert_listeners}" != "7" ]; then
-  printf '[1;31m[错误][0m 期望 7 个 listener，实际 %s。\n' "${assert_listeners}" >&2
-  exit 1
-fi
-printf '[32m✓[0m render_config rc=0，7 个 listener 通过 mihomo -t。\n'
-
-# ---- 6. 实监听：真进程起 7 个端口，全部 LISTEN 后强杀（kill -9 + wait 同调用） ----
-printf '== 实监听冒烟 ==\n'
-"${MIHOMO_BIN}" -d "${BASE_DIR}" -f "${CONFIG_FILE}" >"${BASE_DIR}/accept-run.log" 2>&1 &
-_mpid=$!
-sleep 2
-_missing=""
-# TCP：reality/ws/anytls/argo/socks；UDP：tuic(30862)/hy2(30853)
-for _p in 30831 30851 30861 30854 30855; do
-  if ! (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -qE "[:.]${_p}[[:space:]]"; then
-    _missing="${_missing} tcp/${_p}"
-  fi
+  -keyout "$KEY" -out "$CERT" -days 2 -subj /CN=example.com >/dev/null 2>&1
+keypair="$("$MIHOMO_BIN" generate reality-keypair)"
+private_key="$(printf '%s\n' "$keypair" | awk '/^PrivateKey:/ {print $2}')"
+public_key="$(printf '%s\n' "$keypair" | awk '/^PublicKey:/ {print $2}')"
+[ -n "$private_key" ] && [ -n "$public_key" ]
+uuid=b8b1e0c5-ffd5-487f-a7f2-e72faa8fba7b
+special_name=$'MiXeD-测试\nname\tquote\'"\\end'
+special_password=$'pw\nline\rreturn\ttab\bback\aalert\'"\\end'
+add_fixture() {
+  local tag="$1" protocol="$2" port="$3" extra="${4:-}" node secret
+  [ -n "$extra" ] || extra='{}'
+  node="$(jq -n --arg protocol "$protocol" --arg name "$special_name" --argjson port "$port" \
+    --arg cert "$CERT" --arg key "$KEY" --arg pub "$public_key" --argjson extra "$extra" \
+    '{protocol:$protocol,name:$name,port:$port,certificate_path:$cert,key_path:$key,
+      public_key:$pub,short_id:"0123456789abcdef,abcdef0123456789",reality_server:"example.com",
+      username:"accept-user",ws_path:"/accept",certificate_mode:"self-signed"} + $extra')"
+  secret="$(jq -n --arg uuid "$uuid" --arg private "$private_key" --arg password "$special_password" \
+    '{uuid:$uuid,private_key:$private,password:$password}')"
+  save_node_bundle "$tag" "$node" "$secret"
+}
+add_fixture nreality vless-reality "${PORTS[0]}"
+add_fixture nxudp vless-xudp "${PORTS[1]}"
+add_fixture nws vless-ws-tls "${PORTS[2]}"
+add_fixture nany anytls "${PORTS[3]}"
+add_fixture ntuic tuic-v5 "${PORTS[4]}"
+add_fixture nhy2 hy2 "${PORTS[5]}" '{"up_mbps":0,"down_mbps":0}'
+add_fixture nargo vless-argo "${PORTS[6]}"
+add_fixture nsocks socks5 "${PORTS[7]}"
+add_fixture nhy2mixed hy2 "${PORTS[8]}" '{"up_mbps":0,"down_mbps":100}'
+render_config
+mihomo_validate "$CONFIG_FILE"
+[ "$(grep -c '^  - type:' "$CONFIG_FILE")" -eq 9 ]
+! grep -q '^external-controller:' "$CONFIG_FILE"
+! grep -q '^dns:' "$CONFIG_FILE"
+hy2="$(render_inbound_for_tag nhy2)"
+grep -q 'ignore-client-bandwidth: true' <<<"$hy2"
+! grep -qE '^    (up|down):' <<<"$hy2"
+hy2="$(render_inbound_for_tag nhy2mixed)"
+! grep -q 'ignore-client-bandwidth: true' <<<"$hy2"
+! grep -q '^    up:' <<<"$hy2"
+grep -q '100 Mbps' <<<"$hy2"
+node_meta_array nsocks
+[ "${#NODE_META[@]}" -eq 25 ] && [ "${NODE_META[1]}" = "$special_name" ] && [ "${NODE_META[4]}" = "$special_password" ]
+# Invoke the same helper as standalone production start. exec keeps PID identity exact.
+( mihomo_run "$CONFIG_FILE" ) >"$TEST_ROOT/kernel.log" 2>&1 &
+KERNEL_PID=$!
+ready=0
+for ((attempt=0; attempt<100; attempt++)); do
+  kill -0 "$KERNEL_PID" 2>/dev/null || break
+  snapshot="$(ss -H -ltnup)"
+  ready=1
+  for idx in 0 1 2 3 4 5 6 7 8; do
+    transport=tcp
+    case "$idx" in 4 | 5 | 8) transport=udp ;; esac
+    if ! awk -v port="${PORTS[idx]}" -v proto="$transport" -v pid="$KERNEL_PID" \
+      '$1==proto && $5 ~ (":" port "$") && index($0,"pid=" pid ",") {found=1} END {exit !found}' <<<"$snapshot"; then ready=0; break; fi
+  done
+  [ "$ready" -ne 1 ] || break
+  sleep 0.1
 done
-for _p in 30862 30853; do
-  if ! (ss -lun 2>/dev/null || netstat -lun 2>/dev/null) | grep -qE "[:.]${_p}[[:space:]]"; then
-    _missing="${_missing} udp/${_p}"
-  fi
-done
-kill -9 "${_mpid}" 2>/dev/null || true
-wait "${_mpid}" 2>/dev/null || true
-if [ -n "${_missing}" ]; then
-  printf '[1;31m[错误][0m 以下端口未监听：%s\n' "${_missing}" >&2
-  sed 's/^/  run: /' "${BASE_DIR}/accept-run.log" >&2 || true
-  exit 1
-fi
-printf '[32m✓[0m 7 个 listener 全部实监听（含 :: 双栈、Argo allow-insecure）。\n'
-
-printf '\n== 验收 mihomo 全部通过 ==\n'
+[ "$ready" -eq 1 ] || { printf 'The real process did not own all expected TCP/UDP listeners.\n' >&2; exit 1; }
+# Prove the supplied config was loaded, plus IPv4/IPv6 TCP reachability and Argo loopback.
+python3 - "${PORTS[7]}" "${PORTS[6]}" <<'PY'
+import socket, sys
+for addr in ('127.0.0.1', '::1'):
+    with socket.create_connection((addr, int(sys.argv[1])), timeout=2) as s:
+        s.sendall(b'\x05\x01\x02')
+        assert s.recv(2) == b'\x05\x02', 'SOCKS auth config not loaded'
+with socket.create_connection(('127.0.0.1', int(sys.argv[2])), timeout=2):
+    pass
+PY
+stop_kernel
+release_lock
+printf 'accept-mihomo: PASS — 9 real listeners, specified config, TCP/UDP, dual-stack SOCKS, HY2 zero/mixed and escaped scalars\n'
