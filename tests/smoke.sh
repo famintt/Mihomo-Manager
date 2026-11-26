@@ -739,23 +739,13 @@ assert_eval_true "go_gc=off 启用" '( go_gc=off; go_gc_requested )'
 assert_eval_true "net_tune 默认启用" 'net_tune_requested'
 assert_eval_false "net_tune=0 关闭" '( net_tune=0; net_tune_requested )'
 assert_eval_true "net_tune=1 启用" '( net_tune=1; net_tune_requested )'
-assert_eval_true "TCP buffer 内存上限为 16/32/64 之一" 'case $(get_tcp_buffer_cap_mb) in 16|32|64) true;; *) false;; esac'
-# Fixture-only cap for raw bandwidth mappings; real cap assertions remain unchanged.
-calculate_unclamped_fixture() (
-  get_tcp_buffer_cap_mb() { printf '%s' 64; }
-  calculate_net_tune_buffer_mb "$@"
-)
-assert_eq "asia 低带宽 buffer=8" "8" "$(calculate_unclamped_fixture 100 asia)"
-assert_eq "asia 1G buffer=16" "16" "$(calculate_unclamped_fixture 1000 asia)"
-assert_eq "asia 2G buffer=24" "24" "$(calculate_unclamped_fixture 2000 asia)"
-assert_eq "asia 5G buffer=28" "28" "$(calculate_unclamped_fixture 5000 asia)"
-assert_eq "asia 千兆以上 buffer=32" "32" "$(calculate_unclamped_fixture 10000 asia)"
-assert_eq "asia 下限边界 999Mbps" "12" "$(calculate_unclamped_fixture 999 asia)"
-assert_eq "overseas 低带宽 buffer=16" "16" "$(calculate_unclamped_fixture 300 overseas)"
-assert_eq "overseas 1G buffer=64" "64" "$(calculate_unclamped_fixture 1000 overseas)"
-assert_eq "overseas 下限边界 999Mbps" "48" "$(calculate_unclamped_fixture 999 overseas)"
-assert_eq "算档位 空带宽回退 1000Mbps" "16" "$(calculate_unclamped_fixture "" asia)"
-assert_eval_true "buffer 受内存上限约束" '( B=$(calculate_net_tune_buffer_mb 10000 overseas); [ "$B" -le "$(get_tcp_buffer_cap_mb)" ] )'
+assert_eval_true "TCP buffer 内存档位为 16/32" 'case $(get_tcp_buffer_cap_mb) in 16|32) true;; *) false;; esac'
+assert_eq "128MB 内存档位 16MB" "16" "$(NET_TUNE_MEM_KB=131072 get_tcp_buffer_cap_mb)"
+assert_eq "256MB 内存档位 32MB" "32" "$(NET_TUNE_MEM_KB=262144 get_tcp_buffer_cap_mb)"
+assert_eq "calculate 忽略带宽参数" "32" "$(NET_TUNE_MEM_KB=524288 calculate_net_tune_buffer_mb 100 asia)"
+assert_eval_true "tcp_mem 128MB 安全公式" 'set -- $(NET_TUNE_MEM_KB=131072 manager_tcp_mem_pages); [ "$1" -eq 2048 ] && [ "$2" -eq 4096 ] && [ "$3" -eq 8192 ]'
+assert_eval_true "tcp_mem 1GB 封顶 128MB" 'set -- $(NET_TUNE_MEM_KB=1048576 manager_tcp_mem_pages); [ "$3" -eq 32768 ]'
+assert_eval_true "tune 不写 tcp_notsent_lowat" '! grep -q "tcp_notsent_lowat" "$BASE_DIR/lib/tune.sh"'
 mkdir -p "${TEST_ROOT}/speedtest"
 cat >"${TEST_ROOT}/speedtest/speedtest" <<'EOF'
 #!/usr/bin/env bash

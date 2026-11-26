@@ -45,11 +45,7 @@ vlrt=2083 hypt=2082 name='HK' mm rep      # 已安装时
 | `ws_path` | WS 路径 | 随机 |
 | `up_mbps` `down_mbps` | HY2 带宽 | 200 |
 | `socks5_username` `socks5_password` | SOCKS5 账号 | user / 随机 |
-| `net_tune` | 网络内核调优（BBR+fq+缓冲，使用显式带宽或已持久化测速值；`0/off/no` 关闭） | 开启 |
-| `net_tune_region` | 优化档位：`asia`（保守）或 `overseas`（大缓冲），未设时按延迟推断 | 按延迟推断 |
-| `net_tune_bandwidth_mbps` | 显式指定带宽（Mbps），跳过测速直接按档位优化 | 未设置 |
-| `NET_TUNE_ALLOW_SPEEDTEST=1` | 显式允许运行 Ookla 测速；交互菜单会先询问，非交互默认不测速 | 未设置 |
-| `NET_TUNE_SKIP_SPEEDTEST=1` | 跳过任何测速；不会清除原有带宽/延迟设置 | 未设置 |
+| `net_tune` | 网络内核调优（BBR + fq + 按内存档位的 TCP 缓冲；`0/off/no` 关闭） | 开启 |
 | `sub` | `sub=1` 启用订阅生成；配合 `sub_mode=worker` 上报到 sub-worker | 关闭 |
 | `sub_mode` | 订阅模式：`worker`（固定 Worker，推荐）或 `temp`（临时隧道，兼容旧用法） | `temp` |
 | `sub_domain` | sub-worker 域名，如 `https://sbsub.example.com` | 空 |
@@ -185,7 +181,7 @@ tests/smoke.sh               冒烟测试
 - 保活：systemd 环境用 service + timer；OpenRC/无 systemd 用 cron + pidfile，cloudflared 异常退出约 1 分钟内自动拉起
 - WS-TLS CDN 证书方案（v1.2.4）：CDN 中转统一单端口（`wspt`=回源端口），Cloudflare SSL 用 Full/Full(Strict) 以 HTTPS 回源；`cert=self` 自签即可支持 Full，`cert=custom` 供 Full(Strict) 用 Cloudflare Origin CA 证书；已废弃 `ws_cdn_origin_port` 明文回源。
 - WS-TLS CDN 证书粘贴式导入（v1.2.5）：`cert=custom` 时界面直接把 PEM 证书/私钥内容粘贴进命令（`cert_b64`/`key_b64`），服务器解码写入托管目录自动加载，无需先上传文件；`cert_path`/`key_path` 文件路径方式保留兼容。
-- 智能网络调优（v1.2.0，吸收 Actions-bbr-v3 思路）：默认启用 `BBR + fq` + 收发缓冲，使用显式带宽或已有持久化测速值；只有显式设置 `NET_TUNE_ALLOW_SPEEDTEST=1` 或在交互菜单确认后才运行 Ookla speedtest，非交互默认不测速；测速结果先供用户确认/覆写，再持久化至 `settings.json`，watchdog 后续沿用；按带宽/地区（`asia` 保守、`overseas` 大缓冲）和物理内存上限计算 TCP buffer；补充 `tcp_limit_output_bytes=4MB`、`tcp_slow_start_after_idle=0`。管理菜单 **8. BBR+FQ+缓存设置** 可手动重填或在锁外测速后短时持锁应用；主菜单 **10. 卸载** 会要求确认。
+- 网络内核调优（统一标准，默认启用）：`BBR + fq`，**不测速、不推断带宽/地区**；TCP 缓冲按物理内存选择：`<256MB` 用 16MB，`>=256MB` 用 32MB；`tcp_mem` 按 `max=min(RAM/4,128MB)`（下限 16MB）、`low=max/4`、`pressure=max/2` 推导；收发默认 256KB，并补齐 `somaxconn/netdev_max_backlog/tcp_fastopen/tcp_mtu_probing/tcp_tw_reuse/ip_local_port_range/tcp_slow_start_after_idle=0`；不设 `tcp_notsent_lowat`（低核机器会压吞吐）。参数持久化到 `/etc/sysctl.d/99-mihomo-manager-net-tune.conf`，管理菜单 **8. BBR+FQ+统一网络调优** 可随时重应用/查看；主菜单 **10. 卸载** 会要求确认。
 - 安全：`set -eEuo pipefail`、`umask 077`；管理数据和 PID 文件保持私有，配置与证书仅向专用 Mihomo 账号提供必要只读权限；该账号只能写专用 data 目录。分享链接 authority 对 IPv6 正确加方括号；`build_share_link` 局部变量隔离。
 - CI：Bash 语法、发布入口 ShellCheck、离线发布攻击样例、可复现 bundle 构建、版本/摘要与 `worker.js` 一致性门禁；完整专项和真实核心验收见 [审计整改与验收记录](docs/AUDIT-REMEDIATION.md)。
 - 上游版本见 `metadata/upstream.env`

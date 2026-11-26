@@ -81,64 +81,44 @@ pause_menu() {
 }
 
 net_tune_display_values() {
-  local bw rtt region buf cap
-  bw="$(get_setting "net_tune_bandwidth_mbps")"
-  rtt="$(get_setting "net_tune_latency_ms")"
-  region="$(get_setting "net_tune_region")"
+  local buf cap mem
   buf="$(get_setting "net_tune_buffer_mb")"
   cap="$(get_tcp_buffer_cap_mb)"
-  printf '当前：带宽 %s Mbps | 延迟 %s ms | 档位 %s | TCP缓冲 %s MB（内存上限 %s MB）\n' \
-    "$(hl_num "${bw:-未测}")" "$(hl_num "${rtt:-未测}")" "${region:-未设}" "$(hl_num "${buf:-未算}")" "$(hl_num "${cap}")"
+  mem="$(manager_tcp_mem_pages)"
+  printf '当前：TCP 缓冲 %s MB（内存档位 %s MB） | tcp_mem %s\n' \
+    "$(hl_num "${buf:-未算}")" "$(hl_num "${cap}")" "$(hl_num "${mem}")"
 }
 
 net_tune_apply_manual() {
-  local bandwidth="$1" latency="$2" region buffer_mb buffer_bytes
-  region="$(infer_net_tune_region "${latency}")"
-  buffer_mb="$(calculate_net_tune_buffer_mb "${bandwidth}" "${region}")"
-  set_setting "net_tune_bandwidth_mbps" "${bandwidth}" || return $?
-  set_setting "net_tune_latency_ms" "${latency}" || return $?
-  set_setting "net_tune_region" "${region}" || return $?
+  local buffer_mb cap buffer_bytes
+  cap="$(get_tcp_buffer_cap_mb)" || return 1
+  buffer_mb="${cap}"
   set_setting "net_tune_buffer_mb" "${buffer_mb}" || return $?
   buffer_bytes=$((buffer_mb * 1024 * 1024))
   if [ "$(id -u 2>/dev/null || echo 1)" = "0" ] && command_exists sysctl; then
     apply_sysctls "${buffer_bytes}" || return $?
     apply_sysctls_extra || return $?
   fi
-  print_ok "已应用：带宽 ${COLOR_NUM_HL}${bandwidth}${COLOR_RESET} Mbps，延迟 ${COLOR_NUM_HL}${latency}${COLOR_RESET} ms（${region} 档）→ TCP 缓冲 ${COLOR_NUM_HL}${buffer_mb}${COLOR_RESET}MB。"
+  print_ok "已应用统一网络调优：TCP 缓冲 ${COLOR_NUM_HL}${buffer_mb}${COLOR_RESET}MB（按物理内存自动选择）。"
 }
 
 net_tune_menu() {
-  local choice bw rtt buf
+  local choice
   while true; do
     print_header
-    echo "BBR+FQ+缓存设置"
+    echo "BBR+FQ+统一网络调优"
     echo
     net_tune_display_values
     echo
-    echo "1. 自动测速并确认（测速度+延迟，可人工复核）"
-    echo "2. 手动重填带宽与延迟"
-    echo "3. 查看当前生效 sysctl 网络参数"
+    echo "1. 重新应用统一网络调优"
+    echo "2. 查看当前生效 sysctl 网络参数"
     echo "0. 返回"
     echo
     read -r -p "请选择: " choice || return 0
     case "${choice}" in
     1)
-      # Probe before taking the lock; persist/apply the confirmed result under a short lock.
-      local metric measured_bw measured_rtt confirmed
-      if ! metric="$(probe_net_tune)"; then
-        print_warn "测速未运行或失败；现有设置保持不变。"
-        pause_menu
-        continue
-      fi
-      measured_bw="${metric%% *}"; measured_rtt="${metric#* }"
-      if ! confirmed="$(net_tune_confirm_measurement "${measured_bw}" "${measured_rtt}" "$(infer_net_tune_region "${measured_rtt}")")"; then
-        print_warn "测速结果未确认；现有设置保持不变。"
-        pause_menu
-        continue
-      fi
-      measured_bw="${confirmed%% *}"; measured_rtt="${confirmed#* }"
       acquire_lock || { print_err "无法取得配置锁。"; pause_menu; continue; }
-      if net_tune_apply_manual "${measured_bw}" "${measured_rtt}"; then
+      if net_tune_apply_manual; then
         release_lock
       else
         local rc=$?
@@ -150,32 +130,13 @@ net_tune_menu() {
       pause_menu
       ;;
     2)
-      bw="$(prompt_positive_integer "带宽 (Mbps)" "1000")"
-      rtt="$(prompt_with_default "延迟 (ms，留空自动推断档位)" "$(get_setting "net_tune_latency_ms")")"
-      rtt="$(normalize_input "${rtt}")"
-      if ! [[ "${rtt}" =~ ^[0-9]+$ ]]; then
-        print_warn "延迟无效（${rtt:-空}），回退按 asia 档。"
-        rtt=""
-      fi
-      acquire_lock || { print_err "无法取得配置锁。"; pause_menu; continue; }
-      if net_tune_apply_manual "${bw}" "${rtt}"; then
-        release_lock
-      else
-        local rc=$?
-        release_lock || true
-        print_err "网络调优设置未能应用。"
-        pause_menu
-        return "$rc"
-      fi
-      pause_menu
-      ;;
-    3)
       echo
       echo "------------------ net.core ------------------"
-      sysctl net.core.rmem_max net.core.wmem_max net.core.default_qdisc 2>/dev/null || echo "(无)"
+      sysctl net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default net.core.default_qdisc net.core.netdev_max_backlog net.core.somaxconn 2>/dev/null || echo "(无)"
       echo "------------------ net.ipv4 ------------------"
-      sysctl net.ipv4.tcp_congestion_control net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
-        net.ipv4.tcp_limit_output_bytes net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo "(无)"
+      sysctl net.ipv4.tcp_congestion_control net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_mem \
+        net.ipv4.tcp_limit_output_bytes net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_fastopen \
+        net.ipv4.tcp_mtu_probing net.ipv4.tcp_tw_reuse net.ipv4.ip_local_port_range 2>/dev/null || echo "(无)"
       echo
       pause_menu
       ;;
@@ -199,7 +160,7 @@ main_menu() {
     echo "5. 重启服务"
     echo "6. 查看状态"
     echo "7. 更新项目文件"
-    echo "8. BBR+FQ+缓存设置"
+    echo "8. BBR+FQ+统一网络调优"
     echo "9. 全局设置"
     echo "10. 卸载"
     echo "0. 退出"

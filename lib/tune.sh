@@ -17,51 +17,47 @@ net_tune_requested() {
 
 get_tcp_buffer_cap_mb() {
   local mem_kb
-  mem_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
-  if ! [[ "${mem_kb}" =~ ^[0-9]+$ ]]; then
-    printf '%s' 64
-  elif ((mem_kb < 524288)); then
-    printf '%s' 16
-  elif ((mem_kb < 1048576)); then
-    printf '%s' 32
+  if [[ "${NET_TUNE_MEM_KB:-}" =~ ^[0-9]+$ ]] && [ "${NET_TUNE_MEM_KB}" -gt 0 ]; then
+    mem_kb="${NET_TUNE_MEM_KB}"
   else
-    printf '%s' 64
+    mem_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
+  fi
+  if ! [[ "${mem_kb}" =~ ^[0-9]+$ ]]; then
+    printf '%s' 32
+  elif ((mem_kb < 262144)); then
+    printf '%s' 16
+  else
+    printf '%s' 32
   fi
 }
 
+# 兼容旧调用签名：统一标准不再按带宽/地区分档，只看内存。
 calculate_net_tune_buffer_mb() {
-  local bandwidth="$1" region="$2" cap_mb
-  cap_mb="$(get_tcp_buffer_cap_mb)" || return 1
-  [[ "${cap_mb}" =~ ^[1-9][0-9]{0,2}$ ]] && ((cap_mb <= 64)) || return 1
-  local buffer_mb=16
-  bandwidth="${bandwidth%.*}"
-  if [[ "${bandwidth}" =~ ^[0-9]{1,8}$ ]]; then
-    bandwidth="$((10#${bandwidth}))"
+  printf '%s' "$(get_tcp_buffer_cap_mb)"
+}
+
+manager_tcp_mem_pages() {
+  local mem_kb page_size pages max_pages cap_pages floor_pages low pressure
+  if [[ "${NET_TUNE_MEM_KB:-}" =~ ^[0-9]+$ ]] && [ "${NET_TUNE_MEM_KB}" -gt 0 ]; then
+    mem_kb="${NET_TUNE_MEM_KB}"
   else
-    bandwidth=1000
+    mem_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
   fi
-  ((bandwidth > 0)) || bandwidth=1000
-  if [ "${region}" = "overseas" ]; then
-    if ((bandwidth < 500)); then
-      buffer_mb=16
-    elif ((bandwidth < 1000)); then
-      buffer_mb=48
-    else buffer_mb=64; fi
-  else
-    if ((bandwidth < 500)); then
-      buffer_mb=8
-    elif ((bandwidth < 1000)); then
-      buffer_mb=12
-    elif ((bandwidth < 2000)); then
-      buffer_mb=16
-    elif ((bandwidth < 5000)); then
-      buffer_mb=24
-    elif ((bandwidth < 10000)); then
-      buffer_mb=28
-    else buffer_mb=32; fi
-  fi
-  ((buffer_mb > cap_mb)) && buffer_mb="${cap_mb}"
-  printf '%s' "${buffer_mb}"
+  [[ "${mem_kb}" =~ ^[0-9]+$ ]] && [ "${mem_kb}" -gt 0 ] || mem_kb=262144
+  page_size="$(getconf PAGESIZE 2>/dev/null || printf '4096')"
+  [[ "${page_size}" =~ ^[0-9]+$ ]] && [ "${page_size}" -gt 0 ] || page_size=4096
+  pages=$((mem_kb * 1024 / page_size))
+  [ "${pages}" -gt 0 ] || pages=262144
+  max_pages=$((pages / 4))
+  cap_pages=$((134217728 / page_size))
+  floor_pages=$((16 * 1024 * 1024 / page_size))
+  [ "${max_pages}" -gt "${cap_pages}" ] && max_pages="${cap_pages}"
+  [ "${max_pages}" -lt "${floor_pages}" ] && max_pages="${floor_pages}"
+  low=$((max_pages / 4))
+  pressure=$((max_pages / 2))
+  [ "${low}" -lt 1 ] && low=1
+  [ "${pressure}" -le "${low}" ] && pressure=$((low + 1))
+  printf '%s %s %s' "${low}" "${pressure}" "${max_pages}"
 }
 
 # Only these two manager files are ours. A name alone is not ownership proof;
@@ -103,17 +99,27 @@ remove_net_tune() {
 }
 
 apply_sysctls() {
-  local buffer_bytes="$1" k v ok=true err=""
+  local buffer_bytes="$1" k v ok=true err="" tcp_mem
   [[ "${buffer_bytes}" =~ ^[1-9][0-9]{0,7}$ ]] && ((buffer_bytes <= 67108864)) || return 1
+  tcp_mem="$(manager_tcp_mem_pages)"
   local -a pairs=(
     net.core.rmem_max "${buffer_bytes}"
     net.core.wmem_max "${buffer_bytes}"
-    net.core.default_qdisc fq
+    net.core.rmem_default 262144
+    net.core.wmem_default 262144
     net.ipv4.tcp_congestion_control bbr
-    net.ipv4.tcp_rmem "4096 87380 ${buffer_bytes}"
-    net.ipv4.tcp_wmem "4096 65536 ${buffer_bytes}"
+    net.ipv4.tcp_rmem "4096 262144 ${buffer_bytes}"
+    net.ipv4.tcp_wmem "4096 262144 ${buffer_bytes}"
+    net.ipv4.tcp_mem "${tcp_mem}"
     net.ipv4.tcp_limit_output_bytes 4194304
     net.ipv4.tcp_slow_start_after_idle 0
+    net.core.netdev_max_backlog 8192
+    net.core.somaxconn 4096
+    net.ipv4.tcp_max_syn_backlog 8192
+    net.ipv4.tcp_fastopen 3
+    net.ipv4.tcp_mtu_probing 1
+    net.ipv4.tcp_tw_reuse 1
+    net.ipv4.ip_local_port_range "10000 65535"
   )
   local i
   for ((i = 0; i < ${#pairs[@]}; i += 2)); do
@@ -127,6 +133,14 @@ apply_sysctls() {
       fi
     fi
   done
+
+  # default_qdisc 在部分容器/精简内核中不存在，存在时才写入并校验。
+  if [ -e /proc/sys/net/core/default_qdisc ]; then
+    if ! sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1; then
+      ok=false
+      err="${err}default_qdisc "
+    fi
+  fi
 
   # 核心项写后回读校验（这些键所有常规内核均存在）
   [ "$(sysctl -n net.core.rmem_max 2>/dev/null)" = "${buffer_bytes}" ] || {
@@ -137,10 +151,12 @@ apply_sysctls() {
     ok=false
     err="${err}wmem_max "
   }
-  [ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" = "fq" ] || {
-    ok=false
-    err="${err}default_qdisc "
-  }
+  if [ -e /proc/sys/net/core/default_qdisc ]; then
+    [ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" = "fq" ] || {
+      ok=false
+      err="${err}default_qdisc "
+    }
+  fi
   [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ] || {
     ok=false
     err="${err}tcp_congestion_control "
@@ -149,25 +165,39 @@ apply_sysctls() {
     ok=false
     err="${err}tcp_limit_output_bytes "
   }
+  [ "$(sysctl -n net.ipv4.tcp_mem 2>/dev/null)" = "${tcp_mem}" ] || {
+    ok=false
+    err="${err}tcp_mem "
+  }
 
   local persisted=false
   if [ "${ok}" = true ] && net_tune_write_config 99-mihomo-manager-net-tune.conf <<EOF
-# mihomo-manager net_tune（重启后自动加载）
+# mihomo-manager net_tune：统一标准（内存档位 + tcp_mem + 连接参数），重启后自动加载
 net.core.rmem_max=${buffer_bytes}
 net.core.wmem_max=${buffer_bytes}
+net.core.rmem_default=262144
+net.core.wmem_default=262144
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
-net.ipv4.tcp_rmem=4096 87380 ${buffer_bytes}
-net.ipv4.tcp_wmem=4096 65536 ${buffer_bytes}
+net.ipv4.tcp_rmem=4096 262144 ${buffer_bytes}
+net.ipv4.tcp_wmem=4096 262144 ${buffer_bytes}
+net.ipv4.tcp_mem=${tcp_mem}
 net.ipv4.tcp_limit_output_bytes=4194304
 net.ipv4.tcp_slow_start_after_idle=0
+net.core.netdev_max_backlog=8192
+net.core.somaxconn=4096
+net.ipv4.tcp_max_syn_backlog=8192
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.ip_local_port_range=10000 65535
 EOF
   then
     persisted=true
   fi
 
   if [ "${ok}" = "true" ]; then
-    print_ok "已应用网络调优：BBR + fq + $((buffer_bytes / 1024 / 1024))MB 缓冲（tcp_limit_output_bytes=4MB、slow_start_after_idle=0）。"
+    print_ok "已应用统一网络调优：BBR + fq + TCP 缓冲 $((buffer_bytes / 1024 / 1024))MB（tcp_mem=${tcp_mem}、limit_output=4MB、slow_start_after_idle=0）。"
     if [ "${persisted}" = true ]; then print_ok "已持久化网络调优。"; else print_warn "持久化目录不可写/不存在或文件归属未确认；仅对当前运行生效。"; fi
   else
     print_warn "net_tune：sysctl 写入/回读校验失败（${err}），可能容器或精简内核限制不可调。"
@@ -177,60 +207,20 @@ EOF
 # 2.2/2.3/2.4/2.5：连接生命周期/并发/路径调优（默认值即最适，可整组由 net_tune=off 关闭）。
 # 与核心缓冲项同套容错语义：键不存在（精简内核）跳过，存在但写失败才报 warn。
 apply_sysctls_extra() {
-  local k v ok=true err=""
-  local -a pairs=(
-    net.core.rmem_default 262144
-    net.core.wmem_default 262144
-    net.core.netdev_max_backlog 5000
-    net.core.somaxconn 4096
-    net.ipv4.tcp_notsent_lowat 16384
-    net.ipv4.tcp_tw_reuse 1
-    net.ipv4.ip_local_port_range "10000 65535"
-    net.ipv4.tcp_max_syn_backlog 8192
-    net.ipv4.tcp_mtu_probing 1
-  )
-  local i
-  for ((i = 0; i < ${#pairs[@]}; i += 2)); do
-    k="${pairs[i]}"
-    v="${pairs[i + 1]}"
-    if ! sysctl -w "${k}=${v}" >/dev/null 2>&1; then
-      # 键不存在（精简内核）：无害，跳过；键存在但写入被拒：记失败
-      if [ -n "$(sysctl -n "${k}" 2>/dev/null)" ]; then
-        ok=false
-        err="${err}${k} "
-      fi
-    fi
-  done
-
-  # 2.5：conntrack 上限仅在该子系统可用（存在且可写）时按内存档位抬升，防 NAT 表满丢新连接。
   local ct_max
+  # 连接/路径参数已并入 apply_sysctls 的统一 99- 文件；这里只处理 conntrack。
   if [ -w /proc/sys/net/netfilter/nf_conntrack_max ]; then
     case "$(get_tcp_buffer_cap_mb)" in
     16) ct_max=131072 ;;
-    32) ct_max=196608 ;;
-    *) ct_max=262144 ;;
+    *) ct_max=196608 ;;
     esac
-    if ! sysctl -w "net.netfilter.nf_conntrack_max=${ct_max}" >/dev/null 2>&1; then
-      ok=false
-      err="${err}nf_conntrack_max "
+    if sysctl -w "net.netfilter.nf_conntrack_max=${ct_max}" >/dev/null 2>&1; then
+      print_ok "已应用 conntrack 上限：${ct_max}。"
+    else
+      print_warn "conntrack 上限写入失败，已跳过。"
     fi
   fi
-
-  local persisted=false
-  if [ "${ok}" = true ] && {
-    printf '%s\n' '# mihomo-manager net_tune：连接生命周期/并发/路径（重启后自动加载）'
-    for ((i = 0; i < ${#pairs[@]}; i += 2)); do printf '%s=%s\n' "${pairs[i]}" "${pairs[i + 1]}"; done
-    if [ -n "${ct_max:-}" ]; then printf '%s=%s\n' net.netfilter.nf_conntrack_max "${ct_max}"; fi
-  } | net_tune_write_config 98-mihomo-manager-net-tune-extra.conf; then
-    persisted=true
-  fi
-
-  if [ "${ok}" = "true" ]; then
-    print_ok "已应用连接调优：背压/监听队列/端口区/发送低水位/MTU 探测${ct_max:+（conntrack=${ct_max}）}。"
-    if [ "${persisted}" = true ]; then print_ok "已持久化连接调优。"; else print_warn "连接调优未持久化；目录不可写/不存在或文件归属未确认。"; fi
-  else
-    print_warn "连接调优部分项写入失败（${err}），已跳过受限项。"
-  fi
+  rm -f /etc/sysctl.d/98-mihomo-manager-net-tune-extra.conf 2>/dev/null || true
 }
 
 apply_network_tune() {
@@ -238,26 +228,11 @@ apply_network_tune() {
   [ "$(id -u 2>/dev/null || echo 1)" = 0 ] || return 0
   command_exists sysctl || return 0
   [ "${MM_TEST_MODE:-0}" != 1 ] || return 0
-  local region bandwidth buffer_mb buffer_bytes cap_mb
-  # Applying settings never performs a network probe or reads interactive input.
-  # probe_net_tune is a separate explicit operation performed outside the lock.
-  region="$(manager_env_or_setting net_tune_region '')" || return 1
-  case "${region}" in asia | overseas) ;; *) region=asia ;; esac
-  buffer_mb="$(get_setting net_tune_buffer_mb)" || return 1
-  if ! [[ "${buffer_mb}" =~ ^[1-9][0-9]{0,2}$ ]] || ((buffer_mb > 64)); then
-    bandwidth="$(manager_env_or_setting net_tune_bandwidth_mbps '')" || return 1
-    if ! [[ "${bandwidth}" =~ ^[0-9]{1,8}(\.[0-9]+)?$ ]]; then
-      bandwidth=1000
-      print_info 'net_tune：未提供测量值，采用 1000Mbps 默认档位；可显式测速或手动指定。'
-    fi
-    buffer_mb="$(calculate_net_tune_buffer_mb "${bandwidth}" "${region}")" || return 1
-    set_setting net_tune_bandwidth_mbps "${bandwidth}" || return 1
-    set_setting net_tune_region "${region}" || return 1
-    set_setting net_tune_buffer_mb "${buffer_mb}" || return 1
-  fi
+  local buffer_mb buffer_bytes cap_mb
+  # 统一标准：只按物理内存选 16/32MB，不测速、不按带宽/地区分档。
   cap_mb="$(get_tcp_buffer_cap_mb)" || return 1
-  [[ "${buffer_mb}" =~ ^[1-9][0-9]{0,2}$ ]] && [[ "${cap_mb}" =~ ^[1-9][0-9]{0,2}$ ]] || return 1
-  ((buffer_mb <= cap_mb)) || buffer_mb="${cap_mb}"
+  buffer_mb="${cap_mb}"
+  set_setting net_tune_buffer_mb "${buffer_mb}" || return 1
   buffer_bytes=$((buffer_mb * 1024 * 1024))
   apply_sysctls "${buffer_bytes}" || return 1
   apply_sysctls_extra
